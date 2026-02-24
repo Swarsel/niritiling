@@ -1,0 +1,65 @@
+{ config, lib, ... }:
+
+let
+  cfg = config.services.niritiling;
+in
+{
+  options.services.niritiling = {
+    enable = lib.mkEnableOption "automatic window tiling for the first window in Niri";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "The niritiling package to use.";
+    };
+
+    systemdTarget = lib.mkOption {
+      type = lib.types.str;
+      default = "graphical-session.target";
+      description = "The systemd target to bind the niritiling service to.";
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    systemd.user.services.niritiling = {
+      description = "First-window tiling service for Niri";
+      partOf = [ cfg.systemdTarget ];
+      after = [ cfg.systemdTarget ];
+      wantedBy = [ cfg.systemdTarget ];
+
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/niritiling";
+        Restart = "on-failure";
+        RestartSec = 2;
+
+        CapabilityBoundingSet = "";
+        IPAddressDeny = "any";
+        KeyringMode = "private";
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        NoNewPrivileges = true;
+        PrivateDevices = true;
+        PrivateNetwork = true;
+        PrivateTmp = true;
+        PrivateUsers = true;
+        ProcSubset = "pid";
+        ProtectClock = true;
+        ProtectControlGroups = true;
+        ProtectHome = "read-only";
+        ProtectHostname = true;
+        ProtectKernelLogs = true;
+        ProtectKernelModules = true;
+        ProtectKernelTunables = true;
+        ProtectNetwork = true;
+        ProtectProc = "invisible";
+        ProtectSystem = "strict";
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter = "@system-service";
+        UMask = "0077";
+      };
+    };
+  };
+}
