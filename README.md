@@ -4,6 +4,8 @@ https://github.com/user-attachments/assets/dfd23b5a-aece-4a05-a637-86da40b40d32
 
 niritiling is a simple automatic tiling utility for the first window in a workspace in [Niri](https://github.com/niri-wm/niri).
 
+tl;dr: it makes sure that if there is only a single non-floating window in a workspace, that window will take up the whole space.
+
 When a workspace has a single tiled (=non-floating) window, it is automatically maximized. When a second tiled window is opened in that workspace, the first reverts back to its previous width. When only one window remains in a workspace after closing another, that triggers maximization again. Floating windows are ignored in the count.
 
 ## Usage

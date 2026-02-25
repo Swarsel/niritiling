@@ -16,7 +16,7 @@ in
 
   config = lib.mkIf cfg.enable {
     systemd.user.services.niritiling = {
-      description = "First-window tiling service for Niri";
+      description = "niritiling - first-window tiling service for Niri";
       partOf = [ cfg.systemdTarget ];
       after = [ cfg.systemdTarget ];
       wantedBy = [ cfg.systemdTarget ];
