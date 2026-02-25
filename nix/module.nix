@@ -7,11 +7,6 @@ in
   options.services.niritiling = {
     enable = lib.mkEnableOption "automatic window tiling for the first window in Niri";
 
-    package = lib.mkOption {
-      type = lib.types.package;
-      description = "The niritiling package to use.";
-    };
-
     systemdTarget = lib.mkOption {
       type = lib.types.str;
       default = "graphical-session.target";

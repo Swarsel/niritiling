@@ -45,11 +45,15 @@
         };
       };
 
-      packages.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "niritiling";
-        version = "0.1.0";
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
+      packages = rec {
+        niritiling = pkgs.rustPlatform.buildRustPackage {
+          pname = "niritiling";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          meta.mainProgram = "niritiling";
+        };
+        default = niritiling;
       };
 
       devShells.default = pkgs.mkShell {
@@ -62,11 +66,23 @@
       };
     };
 
-    flake = {
-      nixosModules.default = { pkgs, ... }: {
-        imports = [ ./nix/module.nix ];
-        services.niritiling.package = inputs.nixpkgs.lib.mkDefault inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+    flake =
+      let
+        inherit (inputs.nixpkgs) lib;
+      in
+      {
+        nixosModules = rec {
+          niritiling = { pkgs, ... }: {
+            imports = [ ./nix/module.nix ];
+
+            options.services.niritiling.package = lib.mkOption {
+              type = lib.types.package;
+              description = "The niritiling package to use.";
+              default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.niritiling;
+            };
+          };
+          default = niritiling;
+        };
       };
-    };
   };
 }
