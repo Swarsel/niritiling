@@ -206,7 +206,10 @@ impl NiriContext {
                 self.perform_maximize_action(win_id)?;
             }
         } else {
-            for col_idx in unique_columns {
+            let mut cols_vec: Vec<usize> = unique_columns.into_iter().collect();
+            cols_vec.sort_unstable();
+
+            for &col_idx in &cols_vec {
                 if let Some(w) = tiled_windows
                     .iter()
                     .find(|w| w.layout.pos_in_scrolling_layout.map(|(c, _)| c) == Some(col_idx))
@@ -219,6 +222,23 @@ impl NiriContext {
                         self.perform_maximize_action(w.id)?;
                     }
                 }
+            }
+
+            debug!(
+                "workspace {}: waiting for layout to settle before viewport nudge",
+                ws_id
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            let original_focus = self.query_focused_window().ok().flatten();
+            debug!(
+                "workspace {}: nudging viewport left (current focus: {:?})",
+                ws_id, original_focus
+            );
+            self.send_action(Action::FocusColumnLeft {})?;
+            if let Some(orig_id) = original_focus {
+                debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
+                let _ = self.send_action(Action::FocusWindow { id: orig_id });
             }
         }
         Ok(())
