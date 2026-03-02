@@ -22,6 +22,7 @@ struct WindowPosition {
 struct NiriContext {
     request_socket: Socket,
     tracked_window_positions: HashMap<u64, WindowPosition>,
+    debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
 }
 
 impl NiriContext {
@@ -30,6 +31,7 @@ impl NiriContext {
         Ok(Self {
             request_socket,
             tracked_window_positions: HashMap::new(),
+            debounced_maximize_state: HashMap::new(),
         })
     }
 
@@ -199,6 +201,22 @@ impl NiriContext {
         if column_count == 1 {
             let win_id = tiled_windows[0].id;
             if !self.is_maximized(win_id, state, windows_map) {
+                let now = std::time::Instant::now();
+                if let Some(&(target_maximized, last_time)) =
+                    self.debounced_maximize_state.get(&win_id)
+                {
+                    if target_maximized
+                        && now.duration_since(last_time) < std::time::Duration::from_millis(200)
+                    {
+                        debug!(
+                            "workspace {}: skipping maximize for window {} due to debounce",
+                            ws_id, win_id
+                        );
+                        return Ok(());
+                    }
+                }
+                self.debounced_maximize_state.insert(win_id, (true, now));
+
                 info!(
                     "workspace {}: single column -> maximizing window {}",
                     ws_id, win_id
@@ -215,6 +233,23 @@ impl NiriContext {
                     .find(|w| w.layout.pos_in_scrolling_layout.map(|(c, _)| c) == Some(col_idx))
                 {
                     if self.is_maximized(w.id, state, windows_map) {
+                        let now = std::time::Instant::now();
+                        if let Some(&(target_maximized, last_time)) =
+                            self.debounced_maximize_state.get(&w.id)
+                        {
+                            if !target_maximized
+                                && now.duration_since(last_time)
+                                    < std::time::Duration::from_millis(200)
+                            {
+                                debug!(
+                                    "workspace {}: skipping un-maximize for window {} due to debounce",
+                                    ws_id, w.id
+                                );
+                                continue;
+                            }
+                        }
+                        self.debounced_maximize_state.insert(w.id, (false, now));
+
                         info!(
                             "workspace {}: multiple columns -> un-maximizing window {} in column {}",
                             ws_id, w.id, col_idx
