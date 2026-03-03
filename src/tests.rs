@@ -1,5 +1,7 @@
-use super::*;
-use niri_ipc::Window;
+use super::connection::{NiriConnection, NiriState, WindowPosition};
+use super::manager::NiriContext;
+use anyhow::Result;
+use niri_ipc::{Action, Event, Window};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
