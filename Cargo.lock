@@ -162,6 +162,8 @@ dependencies = [
  "env_logger",
  "log",
  "niri-ipc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

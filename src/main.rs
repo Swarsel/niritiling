@@ -6,38 +6,41 @@ use std::collections::HashMap;
 
 const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
 
-struct NiriState {
-    windows: Vec<Window>,
-    output_widths: HashMap<String, f64>,
-    ws_outputs: HashMap<u64, String>,
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NiriState {
+    pub(crate) windows: Vec<Window>,
+    pub(crate) output_widths: HashMap<String, f64>,
+    pub(crate) ws_outputs: HashMap<u64, String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-struct WindowPosition {
-    workspace_id: u64,
-    column: usize,
-    tile: usize,
+pub(crate) struct WindowPosition {
+    pub(crate) workspace_id: u64,
+    pub(crate) column: usize,
+    pub(crate) tile: usize,
 }
 
-struct NiriContext {
-    request_socket: Socket,
-    tracked_window_positions: HashMap<u64, WindowPosition>,
-    debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
+pub(crate) trait NiriConnection {
+    fn send_action(&mut self, action: Action) -> Result<()>;
+    fn query_focused_window(&mut self) -> Result<Option<u64>>;
+    fn query_full_state(&mut self) -> Result<NiriState>;
 }
 
-impl NiriContext {
+struct SocketConnection {
+    socket: Socket,
+}
+
+impl SocketConnection {
     fn new() -> Result<Self> {
-        let request_socket = Socket::connect().context("connecting to niri for requests")?;
-        Ok(Self {
-            request_socket,
-            tracked_window_positions: HashMap::new(),
-            debounced_maximize_state: HashMap::new(),
-        })
+        let socket = Socket::connect().context("connecting to niri via socket")?;
+        Ok(Self { socket })
     }
+}
 
+impl NiriConnection for SocketConnection {
     fn send_action(&mut self, action: Action) -> Result<()> {
         let reply = self
-            .request_socket
+            .socket
             .send(Request::Action(action.clone()))
             .context("sending action to niri")?;
         match reply {
@@ -58,7 +61,7 @@ impl NiriContext {
 
     fn query_focused_window(&mut self) -> Result<Option<u64>> {
         let reply = self
-            .request_socket
+            .socket
             .send(Request::FocusedWindow)
             .context("querying focused window")?;
         match reply {
@@ -73,7 +76,7 @@ impl NiriContext {
 
     fn query_full_state(&mut self) -> Result<NiriState> {
         let windows = match self
-            .request_socket
+            .socket
             .send(Request::Windows)
             .context("querying windows")?
         {
@@ -82,7 +85,7 @@ impl NiriContext {
         };
 
         let output_widths = match self
-            .request_socket
+            .socket
             .send(Request::Outputs)
             .context("querying outputs")?
         {
@@ -103,7 +106,7 @@ impl NiriContext {
         };
 
         let ws_outputs = match self
-            .request_socket
+            .socket
             .send(Request::Workspaces)
             .context("querying workspaces")?
         {
@@ -124,6 +127,34 @@ impl NiriContext {
             output_widths,
             ws_outputs,
         })
+    }
+}
+
+pub(crate) struct NiriContext {
+    pub(crate) connection: Box<dyn NiriConnection>,
+    pub(crate) tracked_window_positions: HashMap<u64, WindowPosition>,
+    pub(crate) debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
+}
+
+impl NiriContext {
+    pub(crate) fn new(connection: Box<dyn NiriConnection>) -> Self {
+        Self {
+            connection,
+            tracked_window_positions: HashMap::new(),
+            debounced_maximize_state: HashMap::new(),
+        }
+    }
+
+    fn send_action(&mut self, action: Action) -> Result<()> {
+        self.connection.send_action(action)
+    }
+
+    fn query_focused_window(&mut self) -> Result<Option<u64>> {
+        self.connection.query_focused_window()
+    }
+
+    fn query_full_state(&mut self) -> Result<NiriState> {
+        self.connection.query_full_state()
     }
 
     fn is_maximized(
@@ -431,7 +462,8 @@ fn main() -> Result<()> {
 }
 
 fn run_event_loop() -> Result<()> {
-    let mut context = NiriContext::new().context("failed to initialize NiriContext")?;
+    let conn = SocketConnection::new()?;
+    let mut context = NiriContext::new(Box::new(conn));
 
     let mut event_socket = Socket::connect().context("connecting to niri event stream")?;
     let _ = event_socket
@@ -467,3 +499,6 @@ fn run_event_loop() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
