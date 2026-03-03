@@ -153,7 +153,11 @@ impl NiriContext {
         false
     }
 
-    fn perform_maximize_action(&mut self, target_window_id: u64) -> Result<()> {
+    fn perform_maximize_action(
+        &mut self,
+        target_window_id: u64,
+        restore_focus: bool,
+    ) -> Result<()> {
         let original_focus = self.query_focused_window().ok().flatten();
 
         if original_focus != Some(target_window_id) {
@@ -164,10 +168,12 @@ impl NiriContext {
 
         self.send_action(Action::MaximizeColumn {})?;
 
-        if let Some(orig_id) = original_focus {
-            if orig_id != target_window_id {
-                debug!("restoring focus to {}", orig_id);
-                let _ = self.send_action(Action::FocusWindow { id: orig_id });
+        if restore_focus {
+            if let Some(orig_id) = original_focus {
+                if orig_id != target_window_id {
+                    debug!("restoring focus to {}", orig_id);
+                    let _ = self.send_action(Action::FocusWindow { id: orig_id });
+                }
             }
         }
         Ok(())
@@ -221,9 +227,10 @@ impl NiriContext {
                     "workspace {}: single column -> maximizing window {}",
                     ws_id, win_id
                 );
-                self.perform_maximize_action(win_id)?;
+                self.perform_maximize_action(win_id, true)?;
             }
         } else {
+            let target_nudge_focus = self.query_focused_window().ok().flatten();
             let mut cols_vec: Vec<usize> = unique_columns.into_iter().collect();
             cols_vec.sort_unstable();
 
@@ -254,7 +261,7 @@ impl NiriContext {
                             "workspace {}: multiple columns -> un-maximizing window {} in column {}",
                             ws_id, w.id, col_idx
                         );
-                        self.perform_maximize_action(w.id)?;
+                        self.perform_maximize_action(w.id, false)?;
                     }
                 }
             }
@@ -265,13 +272,12 @@ impl NiriContext {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
 
-            let original_focus = self.query_focused_window().ok().flatten();
             debug!(
-                "workspace {}: nudging viewport left (current focus: {:?})",
-                ws_id, original_focus
+                "workspace {}: nudging viewport left (target focus: {:?})",
+                ws_id, target_nudge_focus
             );
             self.send_action(Action::FocusColumnLeft {})?;
-            if let Some(orig_id) = original_focus {
+            if let Some(orig_id) = target_nudge_focus {
                 debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
                 let _ = self.send_action(Action::FocusWindow { id: orig_id });
             }
