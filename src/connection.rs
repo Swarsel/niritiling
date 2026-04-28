@@ -14,8 +14,8 @@ pub struct NiriState {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct WindowPosition {
     pub workspace_id: u64,
-    pub column: usize,
-    pub tile: usize,
+    pub column: Option<usize>,
+    pub tile: Option<usize>,
 }
 
 pub trait NiriConnection: Send {

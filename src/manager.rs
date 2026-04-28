@@ -111,7 +111,9 @@ impl NiriContext {
 
         let column_count = unique_columns.len();
 
-        if column_count == 1 {
+        if column_count == 0 {
+            return Ok(());
+        } else if column_count == 1 {
             let win_id = tiled_windows[0].id;
             if !self.is_maximized(win_id, state, windows_map) {
                 let now = std::time::Instant::now();
@@ -141,6 +143,7 @@ impl NiriContext {
             let mut cols_vec: Vec<usize> = unique_columns.into_iter().collect();
             cols_vec.sort_unstable();
 
+            let mut did_unmaximize = false;
             for &col_idx in &cols_vec {
                 if let Some(w) = tiled_windows
                     .iter()
@@ -169,24 +172,27 @@ impl NiriContext {
                             ws_id, w.id, col_idx
                         );
                         self.perform_maximize_action(w.id, false)?;
+                        did_unmaximize = true;
                     }
                 }
             }
 
-            debug!(
-                "workspace {}: waiting for layout to settle before viewport nudge",
-                ws_id
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if did_unmaximize {
+                debug!(
+                    "workspace {}: waiting for layout to settle before viewport nudge",
+                    ws_id
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
 
-            debug!(
-                "workspace {}: nudging viewport left (target focus: {:?})",
-                ws_id, target_nudge_focus
-            );
-            self.send_action(Action::FocusColumnLeft {})?;
-            if let Some(orig_id) = target_nudge_focus {
-                debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
-                let _ = self.send_action(Action::FocusWindow { id: orig_id });
+                debug!(
+                    "workspace {}: nudging viewport left (target focus: {:?})",
+                    ws_id, target_nudge_focus
+                );
+                self.send_action(Action::FocusColumnLeft {})?;
+                if let Some(orig_id) = target_nudge_focus {
+                    debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
+                    let _ = self.send_action(Action::FocusWindow { id: orig_id });
+                }
             }
         }
         Ok(())
@@ -203,14 +209,18 @@ impl NiriContext {
                 for w in windows {
                     if !w.is_floating {
                         if let Some(ws_id) = w.workspace_id {
-                            if let Some((col, tile)) = w.layout.pos_in_scrolling_layout {
-                                let pos = WindowPosition {
-                                    workspace_id: ws_id,
-                                    column: col,
-                                    tile,
-                                };
-                                new_tracked.insert(w.id, pos);
-                            }
+                            let (col, tile) = w
+                                .layout
+                                .pos_in_scrolling_layout
+                                .map(|(c, t)| (Some(c), Some(t)))
+                                .unwrap_or((None, None));
+
+                            let pos = WindowPosition {
+                                workspace_id: ws_id,
+                                column: col,
+                                tile,
+                            };
+                            new_tracked.insert(w.id, pos);
                         }
                     }
                 }
@@ -245,26 +255,28 @@ impl NiriContext {
                         );
                         affected_workspaces.push(pos.workspace_id);
                     }
-                } else if let (Some(ws_id), Some((col, tile))) =
-                    (ws_id_opt, window.layout.pos_in_scrolling_layout)
-                {
+                } else if let Some(ws_id) = ws_id_opt {
+                    let (col, tile) = window
+                        .layout
+                        .pos_in_scrolling_layout
+                        .map(|(c, t)| (Some(c), Some(t)))
+                        .unwrap_or((None, None));
+
                     let new_pos = WindowPosition {
                         workspace_id: ws_id,
                         column: col,
                         tile,
                     };
 
-                    if old_pos != Some(new_pos) {
-                        self.tracked_window_positions.insert(id, new_pos);
-                        debug!(
-                            "window {} position changed to {:?}, re-evaluating",
-                            id, new_pos
-                        );
-                        affected_workspaces.push(ws_id);
-                        if let Some(old) = old_pos {
-                            if old.workspace_id != ws_id {
-                                affected_workspaces.push(old.workspace_id);
-                            }
+                    self.tracked_window_positions.insert(id, new_pos);
+                    debug!(
+                        "window {} position updated to {:?}, re-evaluating",
+                        id, new_pos
+                    );
+                    affected_workspaces.push(ws_id);
+                    if let Some(old) = old_pos {
+                        if old.workspace_id != ws_id {
+                            affected_workspaces.push(old.workspace_id);
                         }
                     }
                 }
@@ -273,17 +285,18 @@ impl NiriContext {
             Event::WindowLayoutsChanged { changes } => {
                 for (id, layout) in changes {
                     if let Some(pos) = self.tracked_window_positions.get_mut(&id) {
-                        if let Some((col, tile)) = layout.pos_in_scrolling_layout {
-                            if pos.column != col || pos.tile != tile {
-                                debug!(
-                                    "window {} layout changed to column {}, tile {}, re-evaluating ws {}",
-                                    id, col, tile, pos.workspace_id
-                                );
-                                pos.column = col;
-                                pos.tile = tile;
-                                affected_workspaces.push(pos.workspace_id);
-                            }
-                        }
+                        let (col, tile) = layout
+                            .pos_in_scrolling_layout
+                            .map(|(c, t)| (Some(c), Some(t)))
+                            .unwrap_or((None, None));
+
+                        debug!(
+                            "window {} layout updated to column {:?}, tile {:?}, re-evaluating ws {}",
+                            id, col, tile, pos.workspace_id
+                        );
+                        pos.column = col;
+                        pos.tile = tile;
+                        affected_workspaces.push(pos.workspace_id);
                     }
                 }
             }
@@ -304,6 +317,8 @@ impl NiriContext {
         if !affected_workspaces.is_empty() {
             affected_workspaces.sort_unstable();
             affected_workspaces.dedup();
+
+            std::thread::sleep(std::time::Duration::from_millis(20));
 
             let state = self.query_full_state()?;
             let windows_map: HashMap<u64, &Window> =
