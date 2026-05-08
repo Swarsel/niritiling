@@ -48,7 +48,7 @@
       packages = rec {
         niritiling = pkgs.rustPlatform.buildRustPackage {
           pname = "niritiling";
-          version = "0.1.0";
+          version = "0.1.1";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           meta.mainProgram = "niritiling";

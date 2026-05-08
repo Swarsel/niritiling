@@ -187,7 +187,7 @@ fn test_close_one_of_two_columns_maximizes_remaining() {
 }
 
 #[test]
-fn test_close_second_to_last_on_three_columns_no_unnecessary_nudge() {
+fn test_close_second_to_last_on_three_columns_nudges_viewport() {
     let win1 = create_mock_window(100, 1, 0, 0, 500.0);
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let win3 = create_mock_window(102, 1, 2, 0, 500.0);
@@ -223,10 +223,10 @@ fn test_close_second_to_last_on_three_columns_no_unnecessary_nudge() {
 
     let actions = &shared.lock().unwrap().actions;
     assert!(
-        !actions
+        actions
             .iter()
             .any(|a| matches!(a, Action::FocusColumnLeft {})),
-        "FocusColumnLeft should NOT be sent when no un-maximize was needed"
+        "FocusColumnLeft should be sent to nudge viewport left after closing middle column"
     );
 }
 
@@ -562,5 +562,49 @@ fn test_second_event_after_stale_state_maximizes() {
             .iter()
             .any(|a| matches!(a, Action::MaximizeColumn {})),
         "Should maximize when second event sees settled 1-column state"
+    );
+}
+
+#[test]
+fn test_close_rightmost_of_three_columns_nudges_viewport_left() {
+    let win1 = create_mock_window(100, 1, 0, 0, 500.0);
+    let win2 = create_mock_window(101, 1, 1, 0, 500.0);
+    let win3 = create_mock_window(102, 1, 2, 0, 500.0);
+    let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone(), win3.clone()]);
+
+    ctx.tracked_window_positions.insert(
+        100,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(0),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        101,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(1),
+            tile: Some(0),
+        },
+    );
+    ctx.tracked_window_positions.insert(
+        102,
+        WindowPosition {
+            workspace_id: 1,
+            column: Some(2),
+            tile: Some(0),
+        },
+    );
+
+    shared.lock().unwrap().state.windows.retain(|w| w.id != 102);
+    ctx.handle_event(Event::WindowClosed { id: 102 }).unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::FocusColumnLeft {})),
+        "FocusColumnLeft should be sent to nudge viewport left after closing rightmost column"
     );
 }

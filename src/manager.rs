@@ -200,6 +200,7 @@ impl NiriContext {
 
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
         let mut affected_workspaces = Vec::new();
+        let mut closed_positions: Vec<WindowPosition> = Vec::new();
 
         match event {
             Event::WindowsChanged { windows } => {
@@ -308,6 +309,7 @@ impl NiriContext {
                         id, pos.workspace_id
                     );
                     affected_workspaces.push(pos.workspace_id);
+                    closed_positions.push(pos);
                 }
             }
 
@@ -327,6 +329,31 @@ impl NiriContext {
             for ws_id in affected_workspaces {
                 if let Err(e) = self.evaluate_workspace(ws_id, &state, &windows_map) {
                     error!("error evaluating workspace {}: {:?}", ws_id, e);
+                }
+            }
+
+            for closed_pos in &closed_positions {
+                if let Some(closed_col) = closed_pos.column {
+                    let min_remaining_col = self
+                        .tracked_window_positions
+                        .values()
+                        .filter(|p| p.workspace_id == closed_pos.workspace_id)
+                        .filter_map(|p| p.column)
+                        .min();
+
+                    if let Some(min_col) = min_remaining_col {
+                        if closed_col > min_col {
+                            debug!(
+                                "closed window column {} had columns to the left, nudging viewport left",
+                                closed_col
+                            );
+                            let target_focus = self.query_focused_window().ok().flatten();
+                            let _ = self.send_action(Action::FocusColumnLeft {});
+                            if let Some(orig_id) = target_focus {
+                                let _ = self.send_action(Action::FocusWindow { id: orig_id });
+                            }
+                        }
+                    }
                 }
             }
         }
