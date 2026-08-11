@@ -13,6 +13,15 @@ in
       description = "When a column is resized, adjust the other column to compensate (only works with exactly two columns).";
     };
 
+    columnTargets = lib.mkOption {
+      type = lib.types.attrsOf lib.types.ints.positive;
+      default = { };
+      example = {
+        "LG Electronics LG ULTRAFINE 510NTEPPU036" = 3;
+      };
+      description = "Per-output column targets keyed by output identity (\"make model serial\"): columns are sized to fit up to N side by side.";
+    };
+
     systemdTarget = lib.mkOption {
       type = lib.types.str;
       default = "graphical-session.target";
@@ -28,7 +37,13 @@ in
       wantedBy = [ cfg.systemdTarget ];
 
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/niritiling${lib.optionalString cfg.resizeColumns " --resize-columns"}";
+        ExecStart = "${cfg.package}/bin/niritiling${lib.optionalString cfg.resizeColumns " --resize-columns"}${
+          lib.concatStrings (
+            lib.mapAttrsToList (
+              identity: n: " --columns ${lib.escapeShellArg "${identity}=${toString n}"}"
+            ) cfg.columnTargets
+          )
+        }";
         Restart = "on-failure";
         RestartSec = 2;
 

@@ -107,6 +107,7 @@ fn setup_test_with_resize(
         state: NiriState {
             windows,
             output_widths,
+            output_identities: HashMap::new(),
             ws_outputs,
         },
     }));
@@ -114,7 +115,61 @@ fn setup_test_with_resize(
     let conn = Box::new(MockConnection {
         shared: shared.clone(),
     });
-    (NiriContext::new(conn, resize_columns), shared)
+    (
+        NiriContext::new(conn, resize_columns, HashMap::new()),
+        shared,
+    )
+}
+
+const WIDE_IDENTITY: &str = "LG Electronics LG ULTRAFINE 510NTEPPU036";
+
+fn setup_test_wide(
+    windows: Vec<Window>,
+    output_width: f64,
+    target_identity: &str,
+    columns: usize,
+) -> (NiriContext, Arc<Mutex<MockState>>) {
+    let output_name = "DP-1".to_string();
+    let mut output_widths = HashMap::new();
+    output_widths.insert(output_name.clone(), output_width);
+
+    let mut output_identities = HashMap::new();
+    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
+
+    let mut ws_outputs = HashMap::new();
+    ws_outputs.insert(1, output_name);
+
+    let shared = Arc::new(Mutex::new(MockState {
+        actions: Vec::new(),
+        focused_window: None,
+        state: NiriState {
+            windows,
+            output_widths,
+            output_identities,
+            ws_outputs,
+        },
+    }));
+
+    let mut column_targets = HashMap::new();
+    column_targets.insert(target_identity.to_string(), columns);
+
+    let conn = Box::new(MockConnection {
+        shared: shared.clone(),
+    });
+    (NiriContext::new(conn, false, column_targets), shared)
+}
+
+fn proportion_actions(actions: &[Action]) -> Vec<(u64, f64)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SetWindowWidth {
+                id: Some(id),
+                change: SizeChange::SetProportion(p),
+            } => Some((*id, *p)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -803,4 +858,133 @@ fn test_resize_not_triggered_with_three_columns() {
         "Resize redistribution should NOT happen with 3 columns: actions={:?}",
         actions
     );
+}
+
+#[test]
+fn test_wide_output_equalizes_to_thirds() {
+    let win1 = create_mock_window(100, 1, 1, 1, 2560.0);
+    let win2 = create_mock_window(200, 1, 2, 1, 1280.0);
+    let win3 = create_mock_window(300, 1, 3, 1, 1280.0);
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), win2.clone(), win3.clone()],
+        5120.0,
+        WIDE_IDENTITY,
+        3,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(
+        props.len(),
+        3,
+        "expected all three columns resized: {:?}",
+        props
+    );
+    for (_, p) in &props {
+        assert!((p - 100.0 / 3.0).abs() < 0.01, "expected thirds, got {}", p);
+    }
+}
+
+#[test]
+fn test_wide_output_two_columns_get_halves() {
+    let win1 = create_mock_window(100, 1, 1, 1, 2560.0);
+    let win2 = create_mock_window(200, 1, 2, 1, 1280.0);
+    let (mut ctx, shared) =
+        setup_test_wide(vec![win1.clone(), win2.clone()], 5120.0, WIDE_IDENTITY, 3);
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(props.len(), 2, "expected both columns resized: {:?}", props);
+    for (_, p) in &props {
+        assert!((p - 50.0).abs() < 0.01, "expected halves, got {}", p);
+    }
+}
+
+#[test]
+fn test_wide_equalize_only_on_column_count_change() {
+    let win1 = create_mock_window(100, 1, 1, 1, 2560.0);
+    let win2 = create_mock_window(200, 1, 2, 1, 1280.0);
+    let win3 = create_mock_window(300, 1, 3, 1, 1280.0);
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), win2.clone(), win3.clone()],
+        5120.0,
+        WIDE_IDENTITY,
+        3,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1.clone(), win2.clone(), win3.clone()],
+    })
+    .unwrap();
+    shared.lock().unwrap().actions.clear();
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert!(
+        props.is_empty(),
+        "unchanged column count must not re-equalize: {:?}",
+        props
+    );
+}
+
+#[test]
+fn test_non_matching_identity_never_equalizes() {
+    let win1 = create_mock_window(100, 1, 0, 0, 500.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 300.0);
+    let win3 = create_mock_window(300, 1, 2, 0, 200.0);
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), win2.clone(), win3.clone()],
+        5120.0,
+        "HP Inc. HP Z32 CN41212T55",
+        3,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert!(
+        props.is_empty(),
+        "output with non-matching identity must not be equalized: {:?}",
+        props
+    );
+}
+
+#[test]
+fn test_wide_output_above_target_keeps_target_share() {
+    let win1 = create_mock_window(100, 1, 1, 1, 1280.0);
+    let win2 = create_mock_window(200, 1, 2, 1, 1280.0);
+    let win3 = create_mock_window(300, 1, 3, 1, 1280.0);
+    let win4 = create_mock_window(400, 1, 4, 1, 1280.0);
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), win2.clone(), win3.clone(), win4.clone()],
+        5120.0,
+        WIDE_IDENTITY,
+        3,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3, win4],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(props.len(), 4, "expected four columns resized: {:?}", props);
+    for (_, p) in &props {
+        assert!((p - 100.0 / 3.0).abs() < 0.01, "expected thirds, got {}", p);
+    }
 }

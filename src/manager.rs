@@ -11,19 +11,27 @@ pub struct NiriContext {
     pub tracked_window_positions: HashMap<u64, WindowPosition>,
     pub debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
     pub tracked_column_widths: HashMap<u64, HashMap<usize, f64>>,
+    pub tracked_column_counts: HashMap<u64, usize>,
     pub last_maximize_action_time: HashMap<u64, std::time::Instant>,
     pub resize_columns: bool,
+    pub column_targets: HashMap<String, usize>,
 }
 
 impl NiriContext {
-    pub fn new(connection: Box<dyn NiriConnection>, resize_columns: bool) -> Self {
+    pub fn new(
+        connection: Box<dyn NiriConnection>,
+        resize_columns: bool,
+        column_targets: HashMap<String, usize>,
+    ) -> Self {
         Self {
             connection,
             tracked_window_positions: HashMap::new(),
             debounced_maximize_state: HashMap::new(),
             tracked_column_widths: HashMap::new(),
+            tracked_column_counts: HashMap::new(),
             last_maximize_action_time: HashMap::new(),
             resize_columns,
+            column_targets,
         }
     }
 
@@ -204,6 +212,70 @@ impl NiriContext {
                     let _ = self.send_action(Action::FocusWindow { id: orig_id });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn equalize_columns(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+        if self.column_targets.is_empty() {
+            return Ok(());
+        }
+        let output_name = match state.ws_outputs.get(&ws_id) {
+            Some(name) => name,
+            None => return Ok(()),
+        };
+        let target = match state
+            .output_identities
+            .get(output_name)
+            .and_then(|identity| self.column_targets.get(identity))
+        {
+            Some(&t) if t > 0 => t,
+            _ => return Ok(()),
+        };
+
+        let mut columns: std::collections::BTreeMap<usize, (u64, usize)> =
+            std::collections::BTreeMap::new();
+        for w in &state.windows {
+            if w.workspace_id != Some(ws_id) || w.is_floating {
+                continue;
+            }
+            if let Some((col_idx, tile_idx)) = w.layout.pos_in_scrolling_layout {
+                columns
+                    .entry(col_idx)
+                    .and_modify(|entry| {
+                        if tile_idx < entry.1 {
+                            *entry = (w.id, tile_idx);
+                        }
+                    })
+                    .or_insert((w.id, tile_idx));
+            }
+        }
+
+        let count = columns.len();
+        let prev = self.tracked_column_counts.insert(ws_id, count);
+        if count < 2 || prev == Some(count) {
+            return Ok(());
+        }
+
+        let share = 100.0 / (count.min(target) as f64);
+        info!(
+            "workspace {}: {} columns on output {} -> sizing columns to {:.1}%",
+            ws_id, count, output_name, share
+        );
+        let focused = self.query_focused_window().ok().flatten();
+        for &(win_id, _) in columns.values() {
+            self.send_action(Action::SetWindowWidth {
+                id: Some(win_id),
+                change: SizeChange::SetProportion(share),
+            })?;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Some(&(first_id, _)) = columns.values().next() {
+            self.send_action(Action::FocusWindow { id: first_id })?;
+        }
+        if let Some(orig_id) = focused {
+            let _ = self.send_action(Action::FocusWindow { id: orig_id });
         }
         Ok(())
     }
@@ -478,6 +550,9 @@ impl NiriContext {
             for ws_id in affected_workspaces {
                 if let Err(e) = self.evaluate_workspace(ws_id, &state, &windows_map) {
                     error!("error evaluating workspace {}: {:?}", ws_id, e);
+                }
+                if let Err(e) = self.equalize_columns(ws_id, &state) {
+                    error!("error equalizing columns for workspace {}: {:?}", ws_id, e);
                 }
                 if self.resize_columns {
                     if let Err(e) = self.redistribute_on_column_resize(ws_id, &state, &windows_map)
