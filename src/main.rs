@@ -32,8 +32,10 @@ fn main() -> Result<()> {
             "  --columns <IDENTITY>=<N>  Size columns to fit up to N side by side on the output"
         );
         println!(
-            "                            with this identity (\"make model serial\"); repeatable"
+            "                            with this identity (\"make model serial\"); repeatable."
         );
+        println!("                            N=1 keeps the output at one column and stacks newly");
+        println!("                            opened windows into it");
         println!("  -h, --help                Show this help message");
         return Ok(());
     }

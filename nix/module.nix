@@ -6,37 +6,31 @@ in
 {
   options.services.niritiling = {
     enable = lib.mkEnableOption "automatic window tiling for the first window in Niri";
-
+    columnTargets = lib.mkOption {
+      default = { };
+      description = "Per-output column targets (\"make model serial\"): columns are sized to fit up to N side by side. If 1, stacks newly opened windows into the one column (\"vertical stacking\")";
+      example."LG Electronics LG ULTRAFINE 510NTEPPU036" = 3;
+      type = lib.types.attrsOf lib.types.ints.positive;
+    };
     resizeColumns = lib.mkOption {
-      type = lib.types.bool;
       default = false;
       description = "When a column is resized, adjust the other column to compensate (only works with exactly two columns).";
+      type = lib.types.bool;
     };
-
-    columnTargets = lib.mkOption {
-      type = lib.types.attrsOf lib.types.ints.positive;
-      default = { };
-      example = {
-        "LG Electronics LG ULTRAFINE 510NTEPPU036" = 3;
-      };
-      description = "Per-output column targets keyed by output identity (\"make model serial\"): columns are sized to fit up to N side by side.";
-    };
-
     systemdTarget = lib.mkOption {
-      type = lib.types.str;
       default = "graphical-session.target";
       description = "The systemd target to bind the niritiling service to.";
+      type = lib.types.str;
     };
   };
 
   config = lib.mkIf cfg.enable {
     systemd.user.services.niritiling = {
+      after = [ cfg.systemdTarget ];
       description = "niritiling - first-window tiling service for Niri";
       partOf = [ cfg.systemdTarget ];
-      after = [ cfg.systemdTarget ];
-      wantedBy = [ cfg.systemdTarget ];
-
       serviceConfig = {
+        CapabilityBoundingSet = "";
         ExecStart = "${cfg.package}/bin/niritiling${lib.optionalString cfg.resizeColumns " --resize-columns"}${
           lib.concatStrings (
             lib.mapAttrsToList (
@@ -44,10 +38,6 @@ in
             ) cfg.columnTargets
           )
         }";
-        Restart = "on-failure";
-        RestartSec = 2;
-
-        CapabilityBoundingSet = "";
         IPAddressDeny = "any";
         KeyringMode = "private";
         LockPersonality = true;
@@ -68,6 +58,8 @@ in
         ProtectNetwork = true;
         ProtectProc = "invisible";
         ProtectSystem = "strict";
+        Restart = "on-failure";
+        RestartSec = 2;
         RestrictAddressFamilies = [ "AF_UNIX" ];
         RestrictNamespaces = true;
         RestrictRealtime = true;
@@ -76,6 +68,7 @@ in
         SystemCallFilter = "@system-service";
         UMask = "0077";
       };
+      wantedBy = [ cfg.systemdTarget ];
     };
   };
 }

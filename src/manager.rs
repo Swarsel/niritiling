@@ -216,20 +216,73 @@ impl NiriContext {
         Ok(())
     }
 
-    fn equalize_columns(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+    fn column_target(&self, ws_id: u64, state: &NiriState) -> Option<usize> {
         if self.column_targets.is_empty() {
-            return Ok(());
+            return None;
         }
+        let output_name = state.ws_outputs.get(&ws_id)?;
+        self.column_targets
+            .get(state.output_identities.get(output_name)?)
+            .copied()
+            .filter(|&t| t > 0)
+    }
+
+    fn stack_into_single_column(&mut self, ws_id: u64, state: &NiriState) -> Result<bool> {
+        if self.column_target(ws_id, state) != Some(1) {
+            return Ok(false);
+        }
+
+        let mut columns: std::collections::BTreeMap<usize, Vec<(usize, u64)>> =
+            std::collections::BTreeMap::new();
+        for w in &state.windows {
+            if w.workspace_id != Some(ws_id) || w.is_floating {
+                continue;
+            }
+            if let Some((col_idx, tile_idx)) = w.layout.pos_in_scrolling_layout {
+                columns.entry(col_idx).or_default().push((tile_idx, w.id));
+            }
+        }
+
+        if columns.len() < 2 {
+            return Ok(false);
+        }
+
+        let mut stack: Vec<Vec<u64>> = columns
+            .into_values()
+            .map(|mut tiles| {
+                tiles.sort_unstable();
+                tiles.into_iter().map(|(_, id)| id).collect()
+            })
+            .collect();
+
+        info!(
+            "workspace {}: {} columns on single-column output -> stacking into one column",
+            ws_id,
+            stack.len()
+        );
+
+        while stack.len() > 1 {
+            let win_id = stack[1][0];
+            self.send_action(Action::ConsumeOrExpelWindowLeft { id: Some(win_id) })?;
+            if stack[1].len() == 1 {
+                stack.remove(1);
+                stack[0].push(win_id);
+            } else {
+                stack[1].remove(0);
+                stack.insert(1, vec![win_id]);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn equalize_columns(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
         let output_name = match state.ws_outputs.get(&ws_id) {
             Some(name) => name,
             None => return Ok(()),
         };
-        let target = match state
-            .output_identities
-            .get(output_name)
-            .and_then(|identity| self.column_targets.get(identity))
-        {
-            Some(&t) if t > 0 => t,
+        let target = match self.column_target(ws_id, state) {
+            Some(t) if t > 1 => t,
             _ => return Ok(()),
         };
 
@@ -543,7 +596,20 @@ impl NiriContext {
 
             std::thread::sleep(std::time::Duration::from_millis(20));
 
-            let state = self.query_full_state()?;
+            let mut state = self.query_full_state()?;
+
+            let mut stacked = false;
+            for &ws_id in &affected_workspaces {
+                match self.stack_into_single_column(ws_id, &state) {
+                    Ok(acted) => stacked |= acted,
+                    Err(e) => error!("error stacking columns for workspace {}: {:?}", ws_id, e),
+                }
+            }
+            if stacked {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                state = self.query_full_state()?;
+            }
+
             let windows_map: HashMap<u64, &Window> =
                 state.windows.iter().map(|w| (w.id, w)).collect();
 

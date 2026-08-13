@@ -159,6 +159,16 @@ fn setup_test_wide(
     (NiriContext::new(conn, false, column_targets), shared)
 }
 
+fn consume_left_ids(actions: &[Action]) -> Vec<u64> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::ConsumeOrExpelWindowLeft { id: Some(id) } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
 fn proportion_actions(actions: &[Action]) -> Vec<(u64, f64)> {
     actions
         .iter()
@@ -987,4 +997,137 @@ fn test_wide_output_above_target_keeps_target_share() {
     for (_, p) in &props {
         assert!((p - 100.0 / 3.0).abs() < 0.01, "expected thirds, got {}", p);
     }
+}
+
+#[test]
+fn test_single_column_output_stacks_second_column() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2160.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 2160.0);
+    let (mut ctx, shared) =
+        setup_test_wide(vec![win1.clone(), win2.clone()], 2160.0, WIDE_IDENTITY, 1);
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2],
+    })
+    .unwrap();
+
+    assert_eq!(
+        consume_left_ids(&shared.lock().unwrap().actions),
+        vec![200],
+        "the newly opened column should be consumed into the first one"
+    );
+}
+
+#[test]
+fn test_single_column_output_stacks_multi_tile_column() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2160.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 2160.0);
+    let win3 = create_mock_window(300, 1, 1, 1, 2160.0);
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), win2.clone(), win3.clone()],
+        2160.0,
+        WIDE_IDENTITY,
+        1,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3],
+    })
+    .unwrap();
+
+    assert_eq!(
+        consume_left_ids(&shared.lock().unwrap().actions),
+        vec![200, 200, 300],
+        "a stacked column must be expelled tile by tile before merging left"
+    );
+}
+
+#[test]
+fn test_single_column_output_leaves_stack_alone() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2160.0);
+    let win2 = create_mock_window(200, 1, 0, 1, 2160.0);
+    let (mut ctx, shared) =
+        setup_test_wide(vec![win1.clone(), win2.clone()], 2160.0, WIDE_IDENTITY, 1);
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2],
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        consume_left_ids(actions).is_empty(),
+        "windows already in one column must not be touched: {:?}",
+        actions
+    );
+    assert!(
+        proportion_actions(actions).is_empty(),
+        "single-column outputs must not be equalized: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_single_column_output_never_equalizes() {
+    let win1 = create_mock_window(100, 1, 0, 0, 1080.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 1080.0);
+    let (mut ctx, shared) =
+        setup_test_wide(vec![win1.clone(), win2.clone()], 2160.0, WIDE_IDENTITY, 1);
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert!(
+        props.is_empty(),
+        "stacking owns single-column outputs, widths must be left alone: {:?}",
+        props
+    );
+}
+
+#[test]
+fn test_multi_column_target_never_stacks() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2560.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 2560.0);
+    let (mut ctx, shared) =
+        setup_test_wide(vec![win1.clone(), win2.clone()], 5120.0, WIDE_IDENTITY, 3);
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2],
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        consume_left_ids(actions).is_empty(),
+        "outputs with room for several columns must not stack: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_single_column_output_ignores_floating_windows() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2160.0);
+    let mut floating = create_mock_window(200, 1, 1, 0, 800.0);
+    floating.is_floating = true;
+    let (mut ctx, shared) = setup_test_wide(
+        vec![win1.clone(), floating.clone()],
+        2160.0,
+        WIDE_IDENTITY,
+        1,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, floating],
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        consume_left_ids(actions).is_empty(),
+        "floating windows must not be stacked: {:?}",
+        actions
+    );
 }
