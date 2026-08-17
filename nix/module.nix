@@ -55,7 +55,6 @@ in
         ProtectKernelLogs = true;
         ProtectKernelModules = true;
         ProtectKernelTunables = true;
-        ProtectNetwork = true;
         ProtectProc = "invisible";
         ProtectSystem = "strict";
         Restart = "on-failure";

@@ -18,8 +18,6 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = env::args().collect();
-    let resize_columns = args.iter().any(|a| a == "--resize-columns");
-    let column_targets = parse_column_targets(&args)?;
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Usage: niritiling [OPTIONS]");
@@ -40,13 +38,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let resize_columns = args.iter().any(|a| a == "--resize-columns");
+    let column_targets = parse_column_targets(&args)?;
+
     info!(
         "niritiling: starting (resize_columns={}, column_targets={:?})",
         resize_columns, column_targets
     );
 
     loop {
-        if let Err(e) = run_event_loop(resize_columns, column_targets.clone()) {
+        if let Err(e) = run_event_loop(resize_columns, &column_targets) {
             error!(
                 "fatal error in event loop: {:?}. attempting to reconnect in 5 seconds...",
                 e
@@ -74,9 +75,9 @@ fn parse_column_targets(args: &[String]) -> Result<HashMap<String, usize>> {
     Ok(targets)
 }
 
-fn run_event_loop(resize_columns: bool, column_targets: HashMap<String, usize>) -> Result<()> {
+fn run_event_loop(resize_columns: bool, column_targets: &HashMap<String, usize>) -> Result<()> {
     let conn = SocketConnection::new()?;
-    let mut context = NiriContext::new(Box::new(conn), resize_columns, column_targets);
+    let mut context = NiriContext::new(Box::new(conn), resize_columns, column_targets.clone());
 
     let mut event_socket = Socket::connect().context("connecting to niri event stream")?;
     let _ = event_socket
@@ -94,20 +95,13 @@ fn run_event_loop(resize_columns: bool, column_targets: HashMap<String, usize>) 
     })?;
 
     loop {
-        let event = match read_event().context("reading event from niri") {
-            Ok(ev) => ev,
-            Err(e) => {
-                error!(
-                    "error reading from event socket: {:?}. triggering reconnection...",
-                    e
-                );
-                return Err(e);
-            }
-        };
+        let event = read_event().context("reading event from niri")?;
 
         if let Err(e) = context.handle_event(event) {
             error!("error handling event: {:?}", e);
-            if e.to_string().contains("connection") || e.to_string().contains("socket") {
+            if e.chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+            {
                 return Err(e);
             }
         }

@@ -135,6 +135,19 @@ fn create_mock_fullscreen_window(id: u64, ws_id: u64, width: f64) -> Window {
     serde_json::from_value(v).expect("failed to deserialize mock window")
 }
 
+fn track(ctx: &mut NiriContext, positions: &[(u64, usize, usize)]) {
+    for &(id, col, tile) in positions {
+        ctx.tracked_window_positions.insert(
+            id,
+            WindowPosition {
+                workspace_id: 1,
+                column: Some(col),
+                tile: Some(tile),
+            },
+        );
+    }
+}
+
 fn setup_test(windows: Vec<Window>) -> (NiriContext, Arc<Mutex<MockState>>) {
     setup_test_with_resize(windows, false)
 }
@@ -144,20 +157,14 @@ fn setup_test_with_resize(
     resize_columns: bool,
 ) -> (NiriContext, Arc<Mutex<MockState>>) {
     let output_name = "eDP-1".to_string();
-    let mut output_widths = HashMap::new();
-    output_widths.insert(output_name.clone(), 1000.0);
-
-    let mut ws_outputs = HashMap::new();
-    ws_outputs.insert(1, output_name);
-
     let shared = Arc::new(Mutex::new(MockState {
         actions: Vec::new(),
         focused_window: None,
         state: NiriState {
             windows,
-            output_widths,
+            output_widths: HashMap::from([(output_name.clone(), 1000.0)]),
             output_identities: HashMap::new(),
-            ws_outputs,
+            ws_outputs: HashMap::from([(1, output_name)]),
         },
     }));
 
@@ -172,40 +179,52 @@ fn setup_test_with_resize(
 
 const WIDE_IDENTITY: &str = "LG Electronics LG ULTRAFINE 510NTEPPU036";
 
+fn wide_mock_state(windows: Vec<Window>, output_width: f64) -> Arc<Mutex<MockState>> {
+    let output_name = "DP-1".to_string();
+    Arc::new(Mutex::new(MockState {
+        actions: Vec::new(),
+        focused_window: None,
+        state: NiriState {
+            windows,
+            output_widths: HashMap::from([(output_name.clone(), output_width)]),
+            output_identities: HashMap::from([(output_name.clone(), WIDE_IDENTITY.to_string())]),
+            ws_outputs: HashMap::from([(1, output_name)]),
+        },
+    }))
+}
+
 fn setup_test_wide(
     windows: Vec<Window>,
     output_width: f64,
     target_identity: &str,
     columns: usize,
 ) -> (NiriContext, Arc<Mutex<MockState>>) {
-    let output_name = "DP-1".to_string();
-    let mut output_widths = HashMap::new();
-    output_widths.insert(output_name.clone(), output_width);
-
-    let mut output_identities = HashMap::new();
-    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
-
-    let mut ws_outputs = HashMap::new();
-    ws_outputs.insert(1, output_name);
-
-    let shared = Arc::new(Mutex::new(MockState {
-        actions: Vec::new(),
-        focused_window: None,
-        state: NiriState {
-            windows,
-            output_widths,
-            output_identities,
-            ws_outputs,
-        },
-    }));
-
-    let mut column_targets = HashMap::new();
-    column_targets.insert(target_identity.to_string(), columns);
-
+    let shared = wide_mock_state(windows, output_width);
+    let column_targets = HashMap::from([(target_identity.to_string(), columns)]);
     let conn = Box::new(MockConnection {
         shared: shared.clone(),
     });
     (NiriContext::new(conn, false, column_targets), shared)
+}
+
+fn setup_test_settling(
+    windows: Vec<Window>,
+    output_width: f64,
+    queries_until_settle: usize,
+    settled_width: f64,
+) -> (NiriContext, Arc<Mutex<MockState>>, Arc<Mutex<usize>>) {
+    let shared = wide_mock_state(windows, output_width);
+    let counter = Arc::new(Mutex::new(queries_until_settle));
+    let ctx = NiriContext::new(
+        Box::new(SettlingMockConnection {
+            shared: shared.clone(),
+            queries_until_settle: counter.clone(),
+            settled_width,
+        }),
+        false,
+        HashMap::from([(WIDE_IDENTITY.to_string(), 3)]),
+    );
+    (ctx, shared, counter)
 }
 
 fn consume_left_ids(actions: &[Action]) -> Vec<u64> {
@@ -254,14 +273,7 @@ fn test_two_columns_unmaximize() {
     let win1 = create_mock_window(100, 1, 0, 0, 1000.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0)]);
 
     let win2 = create_mock_window(101, 1, 1, 0, 1000.0);
     shared.lock().unwrap().state.windows.push(win2.clone());
@@ -290,22 +302,7 @@ fn test_close_one_of_two_columns_maximizes_remaining() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     shared.lock().unwrap().state.windows.retain(|w| w.id != 101);
     ctx.handle_event(Event::WindowClosed { id: 101 }).unwrap();
@@ -325,30 +322,7 @@ fn test_close_second_to_last_on_three_columns_nudges_viewport() {
     let win3 = create_mock_window(102, 1, 2, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone(), win3.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        102,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(2),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0), (102, 2, 0)]);
 
     shared.lock().unwrap().state.windows.retain(|w| w.id != 101);
     ctx.handle_event(Event::WindowClosed { id: 101 }).unwrap();
@@ -368,22 +342,7 @@ fn test_drag_into_column_maximizes_if_one_left() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     let win2_new = create_mock_window(101, 1, 0, 1, 500.0);
     shared.lock().unwrap().state.windows.retain(|w| w.id != 101);
@@ -406,22 +365,7 @@ fn test_drag_out_of_column_nudges_and_unmaximizes() {
     let win2 = create_mock_window(101, 1, 0, 1, 1000.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(1),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 0, 1)]);
 
     let win2_new = create_mock_window(101, 1, 1, 0, 1000.0);
     shared.lock().unwrap().state.windows.retain(|w| w.id != 101);
@@ -538,22 +482,7 @@ fn test_drag_left_into_right_column_maximizes() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     let win1_stacked = create_mock_window(100, 1, 0, 0, 500.0);
     let win2_stacked = create_mock_window(101, 1, 0, 1, 500.0);
@@ -579,22 +508,7 @@ fn test_drag_left_into_right_column_via_layout_change() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     let win1_stacked = create_mock_window(100, 1, 0, 0, 500.0);
     let win2_stacked = create_mock_window(101, 1, 0, 1, 500.0);
@@ -620,22 +534,7 @@ fn test_stale_state_does_not_send_focus_column_left() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     let win1_moved = create_mock_window(100, 1, 0, 0, 500.0);
     ctx.handle_event(Event::WindowOpenedOrChanged { window: win1_moved })
@@ -656,22 +555,7 @@ fn test_second_event_after_stale_state_maximizes() {
     let win2 = create_mock_window(101, 1, 1, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
     let win1_moved = create_mock_window(100, 1, 0, 0, 500.0);
     ctx.handle_event(Event::WindowOpenedOrChanged { window: win1_moved })
@@ -704,30 +588,7 @@ fn test_close_rightmost_of_three_columns_nudges_viewport_left() {
     let win3 = create_mock_window(102, 1, 2, 0, 500.0);
     let (mut ctx, shared) = setup_test(vec![win1.clone(), win2.clone(), win3.clone()]);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        102,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(2),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0), (102, 2, 0)]);
 
     shared.lock().unwrap().state.windows.retain(|w| w.id != 102);
     ctx.handle_event(Event::WindowClosed { id: 102 }).unwrap();
@@ -747,31 +608,11 @@ fn test_resize_column_redistributes_two_columns() {
     let win2 = create_mock_window_at(101, 1, 1, 0, 500.0, 500.0);
     let (mut ctx, shared) = setup_test_with_resize(vec![win1.clone(), win2.clone()], true);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
-    ctx.tracked_column_widths.insert(1, {
-        let mut m = HashMap::new();
-        m.insert(0, 500.0);
-        m.insert(1, 500.0);
-        m
-    });
+    ctx.tracked_column_widths
+        .insert(1, HashMap::from([(0, 500.0), (1, 500.0)]));
 
-    // Simulate user resizing column 0 from 500 to 600
     let win1_resized = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
     let win2_pushed = create_mock_window_at(101, 1, 1, 0, 500.0, 600.0);
     shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2_pushed];
@@ -807,31 +648,11 @@ fn test_resize_does_not_cascade() {
     let win2 = create_mock_window_at(101, 1, 1, 0, 500.0, 500.0);
     let (mut ctx, shared) = setup_test_with_resize(vec![win1.clone(), win2.clone()], true);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
 
-    ctx.tracked_column_widths.insert(1, {
-        let mut m = HashMap::new();
-        m.insert(0, 500.0);
-        m.insert(1, 500.0);
-        m
-    });
+    ctx.tracked_column_widths
+        .insert(1, HashMap::from([(0, 500.0), (1, 500.0)]));
 
-    // First resize: column 0 grows by 100
     let win1_resized = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
     let win2_same = create_mock_window_at(101, 1, 1, 0, 500.0, 600.0);
     shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2_same];
@@ -842,7 +663,6 @@ fn test_resize_does_not_cascade() {
 
     shared.lock().unwrap().actions.clear();
 
-    // Second event: both columns now at their expected new sizes (our action took effect)
     let win1_final = create_mock_window_at(100, 1, 0, 0, 600.0, 0.0);
     let win2_final = create_mock_window_at(101, 1, 1, 0, 400.0, 600.0);
     shared.lock().unwrap().state.windows = vec![win1_final.clone(), win2_final];
@@ -867,40 +687,11 @@ fn test_resize_not_triggered_with_three_columns() {
     let (mut ctx, shared) =
         setup_test_with_resize(vec![win1.clone(), win2.clone(), win3.clone()], true);
 
-    ctx.tracked_window_positions.insert(
-        100,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(0),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        101,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(1),
-            tile: Some(0),
-        },
-    );
-    ctx.tracked_window_positions.insert(
-        102,
-        WindowPosition {
-            workspace_id: 1,
-            column: Some(2),
-            tile: Some(0),
-        },
-    );
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0), (102, 2, 0)]);
 
-    ctx.tracked_column_widths.insert(1, {
-        let mut m = HashMap::new();
-        m.insert(0, 333.0);
-        m.insert(1, 333.0);
-        m.insert(2, 333.0);
-        m
-    });
+    ctx.tracked_column_widths
+        .insert(1, HashMap::from([(0, 333.0), (1, 333.0), (2, 333.0)]));
 
-    // Resize column 0 in a 3-column layout
     let win1_resized = create_mock_window_at(100, 1, 0, 0, 433.0, 0.0);
     shared.lock().unwrap().state.windows = vec![win1_resized.clone(), win2.clone(), win3.clone()];
 
@@ -1161,37 +952,11 @@ fn test_equalize_nudges_only_after_columns_settle() {
     let win1 = create_mock_window(100, 1, 1, 0, 2560.0);
     let win2 = create_mock_window(200, 1, 2, 0, 2560.0);
     let win3 = create_mock_window(300, 1, 3, 0, 2560.0);
-
-    let output_name = "DP-1".to_string();
-    let mut output_widths = HashMap::new();
-    output_widths.insert(output_name.clone(), 5120.0);
-    let mut output_identities = HashMap::new();
-    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
-    let mut ws_outputs = HashMap::new();
-    ws_outputs.insert(1, output_name);
-
-    let shared = Arc::new(Mutex::new(MockState {
-        actions: Vec::new(),
-        focused_window: None,
-        state: NiriState {
-            windows: vec![win1.clone(), win2.clone(), win3.clone()],
-            output_widths,
-            output_identities,
-            ws_outputs,
-        },
-    }));
-
-    let queries_until_settle = Arc::new(Mutex::new(3usize));
-    let mut column_targets = HashMap::new();
-    column_targets.insert(WIDE_IDENTITY.to_string(), 3);
-    let mut ctx = NiriContext::new(
-        Box::new(SettlingMockConnection {
-            shared: shared.clone(),
-            queries_until_settle: queries_until_settle.clone(),
-            settled_width: 1706.0,
-        }),
-        false,
-        column_targets,
+    let (mut ctx, shared, queries_until_settle) = setup_test_settling(
+        vec![win1.clone(), win2.clone(), win3.clone()],
+        5120.0,
+        3,
+        1706.0,
     );
 
     ctx.handle_event(Event::WindowsChanged {
@@ -1229,49 +994,10 @@ fn test_equalize_nudges_only_after_columns_settle() {
 fn test_close_nudges_only_after_remaining_columns_settle() {
     let win1 = create_mock_window(100, 1, 1, 0, 1706.0);
     let win2 = create_mock_window(200, 1, 2, 0, 1706.0);
+    let (mut ctx, shared, queries_until_settle) =
+        setup_test_settling(vec![win1, win2], 5120.0, 3, 2560.0);
 
-    let output_name = "DP-1".to_string();
-    let mut output_widths = HashMap::new();
-    output_widths.insert(output_name.clone(), 5120.0);
-    let mut output_identities = HashMap::new();
-    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
-    let mut ws_outputs = HashMap::new();
-    ws_outputs.insert(1, output_name);
-
-    let shared = Arc::new(Mutex::new(MockState {
-        actions: Vec::new(),
-        focused_window: None,
-        state: NiriState {
-            windows: vec![win1, win2],
-            output_widths,
-            output_identities,
-            ws_outputs,
-        },
-    }));
-
-    let queries_until_settle = Arc::new(Mutex::new(3usize));
-    let mut column_targets = HashMap::new();
-    column_targets.insert(WIDE_IDENTITY.to_string(), 3);
-    let mut ctx = NiriContext::new(
-        Box::new(SettlingMockConnection {
-            shared: shared.clone(),
-            queries_until_settle: queries_until_settle.clone(),
-            settled_width: 2560.0,
-        }),
-        false,
-        column_targets,
-    );
-
-    for (id, col) in [(100, 1), (200, 2), (300, 3)] {
-        ctx.tracked_window_positions.insert(
-            id,
-            WindowPosition {
-                workspace_id: 1,
-                column: Some(col),
-                tile: Some(0),
-            },
-        );
-    }
+    track(&mut ctx, &[(100, 1, 0), (200, 2, 0), (300, 3, 0)]);
     ctx.tracked_column_counts.insert(1, 3);
 
     ctx.handle_event(Event::WindowClosed { id: 300 }).unwrap();

@@ -2,26 +2,61 @@ use crate::connection::{NiriConnection, NiriState, WindowPosition};
 use anyhow::Result;
 use log::{debug, error, info};
 use niri_ipc::{Action, Event, SizeChange, Window};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
+const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(200);
 
-fn columns_settled(state: &NiriState, ws_id: u64, output_width: f64, share: f64) -> bool {
-    let mut columns: std::collections::BTreeMap<usize, (f64, Option<f64>)> =
-        std::collections::BTreeMap::new();
+fn tiled_columns(state: &NiriState, ws_id: u64) -> BTreeMap<usize, Vec<&Window>> {
+    let mut columns: BTreeMap<usize, Vec<&Window>> = BTreeMap::new();
     for w in &state.windows {
-        if w.workspace_id != Some(ws_id) || w.is_floating {
-            continue;
-        }
-        if let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout {
-            columns.entry(col_idx).or_insert((
-                w.layout.tile_size.0,
-                w.layout.tile_pos_in_workspace_view.map(|(x, _)| x),
-            ));
+        if w.workspace_id == Some(ws_id)
+            && !w.is_floating
+            && let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout
+        {
+            columns.entry(col_idx).or_default().push(w);
         }
     }
+    for tiles in columns.values_mut() {
+        tiles.sort_by_key(|w| {
+            w.layout
+                .pos_in_scrolling_layout
+                .map(|(_, tile_idx)| tile_idx)
+        });
+    }
+    columns
+}
 
-    let entries: Vec<(f64, Option<f64>)> = columns.into_values().collect();
+fn is_maximized(window: &Window, state: &NiriState) -> bool {
+    let output_width = window
+        .workspace_id
+        .and_then(|ws_id| state.ws_outputs.get(&ws_id))
+        .and_then(|output_name| state.output_widths.get(output_name))
+        .copied()
+        .unwrap_or(0.0);
+    if output_width <= 0.0 {
+        return false;
+    }
+    let tile_width = window.layout.tile_size.0;
+    let ratio = tile_width / output_width;
+    debug!(
+        "window {} tile_width={:.0} output_width={:.0} ratio={:.2}",
+        window.id, tile_width, output_width, ratio
+    );
+    ratio > MAXIMIZED_RATIO_THRESHOLD
+}
+
+fn columns_settled(state: &NiriState, ws_id: u64, output_width: f64, share: f64) -> bool {
+    let entries: Vec<(f64, Option<f64>)> = tiled_columns(state, ws_id)
+        .into_values()
+        .map(|tiles| {
+            (
+                tiles[0].layout.tile_size.0,
+                tiles[0].layout.tile_pos_in_workspace_view.map(|(x, _)| x),
+            )
+        })
+        .collect();
     let gap = entries
         .windows(2)
         .find_map(|pair| Some((pair[1].1? - pair[0].1? - pair[0].0).max(0.0)))
@@ -38,10 +73,10 @@ fn columns_settled(state: &NiriState, ws_id: u64, output_width: f64, share: f64)
 pub struct NiriContext {
     pub connection: Box<dyn NiriConnection>,
     pub tracked_window_positions: HashMap<u64, WindowPosition>,
-    pub debounced_maximize_state: HashMap<u64, (bool, std::time::Instant)>,
+    pub debounced_maximize_state: HashMap<u64, (bool, Instant)>,
     pub tracked_column_widths: HashMap<u64, HashMap<usize, f64>>,
     pub tracked_column_counts: HashMap<u64, usize>,
-    pub last_maximize_action_time: HashMap<u64, std::time::Instant>,
+    pub last_maximize_action_time: HashMap<u64, Instant>,
     pub resize_columns: bool,
     pub column_targets: HashMap<String, usize>,
 }
@@ -76,31 +111,29 @@ impl NiriContext {
         self.connection.query_full_state()
     }
 
-    fn is_maximized(
-        &self,
-        window_id: u64,
-        state: &NiriState,
-        windows_map: &HashMap<u64, &Window>,
-    ) -> bool {
-        if let Some(w) = windows_map.get(&window_id) {
-            if let Some(ws_id) = w.workspace_id {
-                if let Some(output_name) = state.ws_outputs.get(&ws_id) {
-                    if let Some(&output_width) = state.output_widths.get(output_name) {
-                        if output_width <= 0.0 {
-                            return false;
-                        }
-                        let tile_width = w.layout.tile_size.0;
-                        let ratio = tile_width / output_width;
-                        debug!(
-                            "window {} tile_width={:.0} output_width={:.0} ratio={:.2}",
-                            window_id, tile_width, output_width, ratio
-                        );
-                        return ratio > MAXIMIZED_RATIO_THRESHOLD;
-                    }
-                }
-            }
+    fn debounce_allows(&mut self, win_id: u64, target_maximized: bool) -> bool {
+        let now = Instant::now();
+        if let Some(&(prev_target, last_time)) = self.debounced_maximize_state.get(&win_id)
+            && prev_target == target_maximized
+            && now.duration_since(last_time) < DEBOUNCE_INTERVAL
+        {
+            debug!(
+                "window {}: skipping repeated maximize state change due to debounce",
+                win_id
+            );
+            return false;
         }
-        false
+        self.debounced_maximize_state
+            .insert(win_id, (target_maximized, now));
+        true
+    }
+
+    fn nudge_viewport_left(&mut self) {
+        let focused = self.query_focused_window().ok().flatten();
+        let _ = self.send_action(Action::FocusColumnLeft {});
+        if let Some(orig_id) = focused {
+            let _ = self.send_action(Action::FocusWindow { id: orig_id });
+        }
     }
 
     fn perform_maximize_action(
@@ -118,128 +151,65 @@ impl NiriContext {
 
         self.send_action(Action::MaximizeColumn {})?;
 
-        if restore_focus {
-            if let Some(orig_id) = original_focus {
-                if orig_id != target_window_id {
-                    debug!("restoring focus to {}", orig_id);
-                    let _ = self.send_action(Action::FocusWindow { id: orig_id });
-                }
-            }
+        if restore_focus
+            && let Some(orig_id) = original_focus
+            && orig_id != target_window_id
+        {
+            debug!("restoring focus to {}", orig_id);
+            let _ = self.send_action(Action::FocusWindow { id: orig_id });
         }
         Ok(())
     }
 
-    pub fn evaluate_workspace(
-        &mut self,
-        ws_id: u64,
-        state: &NiriState,
-        windows_map: &HashMap<u64, &Window>,
-    ) -> Result<()> {
-        let tiled_windows: Vec<&Window> = state
-            .windows
-            .iter()
-            .filter(|w| w.workspace_id == Some(ws_id) && !w.is_floating)
-            .collect();
+    pub fn evaluate_workspace(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+        let columns = tiled_columns(state, ws_id);
 
-        if tiled_windows.is_empty() {
-            return Ok(());
-        }
-
-        let mut unique_columns = std::collections::HashSet::new();
-        for w in &tiled_windows {
-            if let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout {
-                unique_columns.insert(col_idx);
-            }
-        }
-
-        let column_count = unique_columns.len();
-
-        if column_count == 0 {
-            return Ok(());
-        } else if column_count == 1 {
-            let win_id = tiled_windows[0].id;
-            if !self.is_maximized(win_id, state, windows_map) {
-                let now = std::time::Instant::now();
-                if let Some(&(target_maximized, last_time)) =
-                    self.debounced_maximize_state.get(&win_id)
-                {
-                    if target_maximized
-                        && now.duration_since(last_time) < std::time::Duration::from_millis(200)
-                    {
-                        debug!(
-                            "workspace {}: skipping maximize for window {} due to debounce",
-                            ws_id, win_id
-                        );
-                        return Ok(());
-                    }
-                }
-                self.debounced_maximize_state.insert(win_id, (true, now));
-
+        if columns.len() == 1 {
+            let window = columns.values().next().unwrap()[0];
+            if !is_maximized(window, state) && self.debounce_allows(window.id, true) {
                 info!(
                     "workspace {}: single column -> maximizing window {}",
-                    ws_id, win_id
+                    ws_id, window.id
                 );
-                self.perform_maximize_action(win_id, true)?;
-                self.last_maximize_action_time
-                    .insert(ws_id, std::time::Instant::now());
+                self.perform_maximize_action(window.id, true)?;
+                self.last_maximize_action_time.insert(ws_id, Instant::now());
             }
-        } else {
-            let target_nudge_focus = self.query_focused_window().ok().flatten();
-            let mut cols_vec: Vec<usize> = unique_columns.into_iter().collect();
-            cols_vec.sort_unstable();
+            return Ok(());
+        }
 
-            let mut did_unmaximize = false;
-            for &col_idx in &cols_vec {
-                if let Some(w) = tiled_windows
-                    .iter()
-                    .find(|w| w.layout.pos_in_scrolling_layout.map(|(c, _)| c) == Some(col_idx))
-                {
-                    if self.is_maximized(w.id, state, windows_map) {
-                        let now = std::time::Instant::now();
-                        if let Some(&(target_maximized, last_time)) =
-                            self.debounced_maximize_state.get(&w.id)
-                        {
-                            if !target_maximized
-                                && now.duration_since(last_time)
-                                    < std::time::Duration::from_millis(200)
-                            {
-                                debug!(
-                                    "workspace {}: skipping un-maximize for window {} due to debounce",
-                                    ws_id, w.id
-                                );
-                                continue;
-                            }
-                        }
-                        self.debounced_maximize_state.insert(w.id, (false, now));
-
-                        info!(
-                            "workspace {}: multiple columns -> un-maximizing window {} in column {}",
-                            ws_id, w.id, col_idx
-                        );
-                        self.perform_maximize_action(w.id, false)?;
-                        did_unmaximize = true;
-                    }
+        let mut original_focus = None;
+        let mut did_unmaximize = false;
+        for (&col_idx, tiles) in &columns {
+            let window = tiles[0];
+            if is_maximized(window, state) && self.debounce_allows(window.id, false) {
+                if !did_unmaximize {
+                    original_focus = self.query_focused_window().ok().flatten();
                 }
+                info!(
+                    "workspace {}: multiple columns -> un-maximizing window {} in column {}",
+                    ws_id, window.id, col_idx
+                );
+                self.perform_maximize_action(window.id, false)?;
+                did_unmaximize = true;
             }
+        }
 
-            if did_unmaximize {
-                self.last_maximize_action_time
-                    .insert(ws_id, std::time::Instant::now());
-                debug!(
-                    "workspace {}: waiting for layout to settle before viewport nudge",
-                    ws_id
-                );
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        if did_unmaximize {
+            self.last_maximize_action_time.insert(ws_id, Instant::now());
+            debug!(
+                "workspace {}: waiting for layout to settle before viewport nudge",
+                ws_id
+            );
+            std::thread::sleep(Duration::from_millis(50));
 
-                debug!(
-                    "workspace {}: nudging viewport left (target focus: {:?})",
-                    ws_id, target_nudge_focus
-                );
-                self.send_action(Action::FocusColumnLeft {})?;
-                if let Some(orig_id) = target_nudge_focus {
-                    debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
-                    let _ = self.send_action(Action::FocusWindow { id: orig_id });
-                }
+            debug!(
+                "workspace {}: nudging viewport left (target focus: {:?})",
+                ws_id, original_focus
+            );
+            self.send_action(Action::FocusColumnLeft {})?;
+            if let Some(orig_id) = original_focus {
+                debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
+                let _ = self.send_action(Action::FocusWindow { id: orig_id });
             }
         }
         Ok(())
@@ -261,27 +231,14 @@ impl NiriContext {
             return Ok(false);
         }
 
-        let mut columns: std::collections::BTreeMap<usize, Vec<(usize, u64)>> =
-            std::collections::BTreeMap::new();
-        for w in &state.windows {
-            if w.workspace_id != Some(ws_id) || w.is_floating {
-                continue;
-            }
-            if let Some((col_idx, tile_idx)) = w.layout.pos_in_scrolling_layout {
-                columns.entry(col_idx).or_default().push((tile_idx, w.id));
-            }
-        }
-
+        let columns = tiled_columns(state, ws_id);
         if columns.len() < 2 {
             return Ok(false);
         }
 
         let mut stack: Vec<Vec<u64>> = columns
             .into_values()
-            .map(|mut tiles| {
-                tiles.sort_unstable();
-                tiles.into_iter().map(|(_, id)| id).collect()
-            })
+            .map(|tiles| tiles.iter().map(|w| w.id).collect())
             .collect();
 
         info!(
@@ -309,7 +266,7 @@ impl NiriContext {
         for _ in 0..24 {
             match self.query_full_state() {
                 Ok(state) if columns_settled(&state, ws_id, output_width, share) => return,
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Ok(_) => std::thread::sleep(Duration::from_millis(25)),
                 Err(_) => return,
             }
         }
@@ -329,25 +286,12 @@ impl NiriContext {
             _ => return Ok(()),
         };
 
-        let mut columns: std::collections::BTreeMap<usize, (u64, usize)> =
-            std::collections::BTreeMap::new();
-        for w in &state.windows {
-            if w.workspace_id != Some(ws_id) || w.is_floating {
-                continue;
-            }
-            if let Some((col_idx, tile_idx)) = w.layout.pos_in_scrolling_layout {
-                columns
-                    .entry(col_idx)
-                    .and_modify(|entry| {
-                        if tile_idx < entry.1 {
-                            *entry = (w.id, tile_idx);
-                        }
-                    })
-                    .or_insert((w.id, tile_idx));
-            }
-        }
+        let column_ids: Vec<u64> = tiled_columns(state, ws_id)
+            .into_values()
+            .map(|tiles| tiles[0].id)
+            .collect();
 
-        let count = columns.len();
+        let count = column_ids.len();
         let prev = self.tracked_column_counts.insert(ws_id, count);
         if count < 2 || prev == Some(count) {
             return Ok(());
@@ -358,7 +302,7 @@ impl NiriContext {
             "workspace {}: {} columns on output {} -> sizing columns to {:.1}%",
             ws_id, count, output_name, share
         );
-        for &(win_id, _) in columns.values() {
+        for &win_id in &column_ids {
             self.send_action(Action::SetWindowWidth {
                 id: Some(win_id),
                 change: SizeChange::SetProportion(share),
@@ -369,14 +313,14 @@ impl NiriContext {
             Some(&width) if width > 0.0 && count <= target => {
                 self.wait_for_columns_to_settle(ws_id, width, share)
             }
-            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => std::thread::sleep(Duration::from_millis(50)),
         }
 
         let focused = self.query_focused_window().ok().flatten();
-        if let Some(&(first_id, _)) = columns.values().next() {
+        if let Some(&first_id) = column_ids.first() {
             self.send_action(Action::FocusWindow { id: first_id })?;
         }
-        if let Some(&(last_id, _)) = columns.values().next_back() {
+        if let Some(&last_id) = column_ids.last() {
             self.send_action(Action::FocusWindow { id: last_id })?;
         }
         if let Some(orig_id) = focused {
@@ -385,12 +329,7 @@ impl NiriContext {
         Ok(())
     }
 
-    fn redistribute_on_column_resize(
-        &mut self,
-        ws_id: u64,
-        state: &NiriState,
-        _windows_map: &HashMap<u64, &Window>,
-    ) -> Result<()> {
+    fn redistribute_on_column_resize(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
         let output_name = match state.ws_outputs.get(&ws_id) {
             Some(name) => name,
             None => return Ok(()),
@@ -400,126 +339,75 @@ impl NiriContext {
             _ => return Ok(()),
         };
 
-        let tiled: Vec<&Window> = state
-            .windows
-            .iter()
-            .filter(|w| w.workspace_id == Some(ws_id) && !w.is_floating)
-            .filter(|w| w.layout.pos_in_scrolling_layout.is_some())
+        let current: Vec<(usize, f64, u64)> = tiled_columns(state, ws_id)
+            .into_iter()
+            .map(|(col_idx, tiles)| (col_idx, tiles[0].layout.tile_size.0, tiles[0].id))
             .collect();
 
-        let mut current_columns: HashMap<usize, (f64, u64)> = HashMap::new();
-        for w in &tiled {
-            if let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout {
-                current_columns
-                    .entry(col_idx)
-                    .or_insert((w.layout.tile_size.0, w.id));
-            }
-        }
-
-        let col_count = current_columns.len();
-
-        // Only handle exactly 2 columns
-        if col_count != 2 {
-            self.tracked_column_widths.clear();
+        if current.len() != 2 {
+            self.tracked_column_widths.remove(&ws_id);
             return Ok(());
         }
-
-        let prev_widths = self.tracked_column_widths.get(&ws_id);
 
         let suppressed = self
             .last_maximize_action_time
             .get(&ws_id)
-            .map_or(false, |t| {
-                t.elapsed() < std::time::Duration::from_millis(500)
-            });
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500));
 
-        let any_maximized = current_columns
-            .values()
-            .any(|&(w, _)| w / output_width > MAXIMIZED_RATIO_THRESHOLD);
+        let any_maximized = current
+            .iter()
+            .any(|&(_, width, _)| width / output_width > MAXIMIZED_RATIO_THRESHOLD);
 
-        if !suppressed && !any_maximized && prev_widths.is_some_and(|pw| pw.len() == 2) {
-            let prev = prev_widths.unwrap();
+        if !suppressed
+            && !any_maximized
+            && let Some(prev) = self.tracked_column_widths.get(&ws_id)
+            && prev.len() == 2
+        {
+            let deltas: Vec<f64> = current
+                .iter()
+                .map(|&(col_idx, width, _)| width - prev.get(&col_idx).copied().unwrap_or(width))
+                .collect();
+            let changed: Vec<usize> = (0..deltas.len())
+                .filter(|&i| deltas[i].abs() > 2.0)
+                .collect();
 
-            let cols: Vec<usize> = current_columns.keys().copied().collect();
-            let col_a = cols[0];
-            let col_b = cols[1];
-
-            let (cur_a, _wid_a) = current_columns[&col_a];
-            let (cur_b, wid_b) = current_columns[&col_b];
-            let prev_a = prev.get(&col_a).copied().unwrap_or(cur_a);
-            let prev_b = prev.get(&col_b).copied().unwrap_or(cur_b);
-
-            let delta_a = cur_a - prev_a;
-            let delta_b = cur_b - prev_b;
-
-            // Only act when exactly one column changed by a meaningful amount
-            // and the other didn't (i.e. the user resized one column)
-            let a_changed = delta_a.abs() > 2.0;
-            let b_changed = delta_b.abs() > 2.0;
-
-            if a_changed && !b_changed {
-                let delta_px = delta_a.round() as i32;
+            if let [changed_idx] = changed[..] {
+                let (changed_col, changed_width, _) = current[changed_idx];
+                let (other_col, other_width, other_id) = current[1 - changed_idx];
+                let delta = deltas[changed_idx];
+                let delta_px = delta.round() as i32;
                 info!(
                     "workspace {}: column {} resized by {}px, adjusting column {} (window {})",
-                    ws_id, col_a, delta_px, col_b, wid_b
+                    ws_id, changed_col, delta_px, other_col, other_id
                 );
-                let focused = self.query_focused_window().ok().flatten();
                 self.send_action(Action::SetWindowWidth {
-                    id: Some(wid_b),
+                    id: Some(other_id),
                     change: SizeChange::AdjustFixed(-delta_px),
                 })?;
 
-                // If the left column grew, nudge viewport after layout settles
-                if col_b < col_a && delta_px < 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let _ = self.send_action(Action::FocusColumnLeft {});
-                    if let Some(orig) = focused {
-                        let _ = self.send_action(Action::FocusWindow { id: orig });
-                    }
+                if other_col < changed_col && delta_px < 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    self.nudge_viewport_left();
                 }
 
-                // Update tracking to the expected state so we don't re-trigger
-                let mut new_tracked = HashMap::new();
-                new_tracked.insert(col_a, cur_a);
-                new_tracked.insert(col_b, cur_b - delta_a);
-                self.tracked_column_widths.insert(ws_id, new_tracked);
-                return Ok(());
-            } else if b_changed && !a_changed {
-                let (_, wid_a) = current_columns[&col_a];
-                let delta_px = delta_b.round() as i32;
-                info!(
-                    "workspace {}: column {} resized by {}px, adjusting column {} (window {})",
-                    ws_id, col_b, delta_px, col_a, wid_a
+                self.tracked_column_widths.insert(
+                    ws_id,
+                    HashMap::from([
+                        (changed_col, changed_width),
+                        (other_col, other_width - delta),
+                    ]),
                 );
-                let focused = self.query_focused_window().ok().flatten();
-                self.send_action(Action::SetWindowWidth {
-                    id: Some(wid_a),
-                    change: SizeChange::AdjustFixed(-delta_px),
-                })?;
-
-                // If the left column grew, nudge viewport after layout settles
-                if col_a < col_b && delta_px < 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let _ = self.send_action(Action::FocusColumnLeft {});
-                    if let Some(orig) = focused {
-                        let _ = self.send_action(Action::FocusWindow { id: orig });
-                    }
-                }
-
-                let mut new_tracked = HashMap::new();
-                new_tracked.insert(col_a, cur_a - delta_b);
-                new_tracked.insert(col_b, cur_b);
-                self.tracked_column_widths.insert(ws_id, new_tracked);
                 return Ok(());
             }
         }
 
-        // Update tracking baseline
-        let widths: HashMap<usize, f64> = current_columns
-            .iter()
-            .map(|(&col, &(w, _))| (col, w))
-            .collect();
-        self.tracked_column_widths.insert(ws_id, widths);
+        self.tracked_column_widths.insert(
+            ws_id,
+            current
+                .into_iter()
+                .map(|(col_idx, width, _)| (col_idx, width))
+                .collect(),
+        );
 
         Ok(())
     }
@@ -534,21 +422,18 @@ impl NiriContext {
                 let mut new_tracked = HashMap::with_capacity(windows.len());
 
                 for w in windows {
-                    if !w.is_floating {
-                        if let Some(ws_id) = w.workspace_id {
-                            let (col, tile) = w
-                                .layout
-                                .pos_in_scrolling_layout
-                                .map(|(c, t)| (Some(c), Some(t)))
-                                .unwrap_or((None, None));
-
-                            let pos = WindowPosition {
+                    if !w.is_floating
+                        && let Some(ws_id) = w.workspace_id
+                    {
+                        let (col, tile) = w.layout.pos_in_scrolling_layout.unzip();
+                        new_tracked.insert(
+                            w.id,
+                            WindowPosition {
                                 workspace_id: ws_id,
                                 column: col,
                                 tile,
-                            };
-                            new_tracked.insert(w.id, pos);
-                        }
+                            },
+                        );
                     }
                 }
 
@@ -563,17 +448,16 @@ impl NiriContext {
                     }
                 }
 
+                self.debounced_maximize_state
+                    .retain(|id, _| new_tracked.contains_key(id));
                 self.tracked_window_positions = new_tracked;
             }
 
             Event::WindowOpenedOrChanged { window } => {
                 let id = window.id;
-                let ws_id_opt = window.workspace_id;
-                let is_floating = window.is_floating;
-
                 let old_pos = self.tracked_window_positions.get(&id).copied();
 
-                if is_floating {
+                if window.is_floating {
                     if let Some(pos) = old_pos {
                         self.tracked_window_positions.remove(&id);
                         info!(
@@ -582,13 +466,8 @@ impl NiriContext {
                         );
                         affected_workspaces.push(pos.workspace_id);
                     }
-                } else if let Some(ws_id) = ws_id_opt {
-                    let (col, tile) = window
-                        .layout
-                        .pos_in_scrolling_layout
-                        .map(|(c, t)| (Some(c), Some(t)))
-                        .unwrap_or((None, None));
-
+                } else if let Some(ws_id) = window.workspace_id {
+                    let (col, tile) = window.layout.pos_in_scrolling_layout.unzip();
                     let new_pos = WindowPosition {
                         workspace_id: ws_id,
                         column: col,
@@ -601,10 +480,10 @@ impl NiriContext {
                         id, new_pos
                     );
                     affected_workspaces.push(ws_id);
-                    if let Some(old) = old_pos {
-                        if old.workspace_id != ws_id {
-                            affected_workspaces.push(old.workspace_id);
-                        }
+                    if let Some(old) = old_pos
+                        && old.workspace_id != ws_id
+                    {
+                        affected_workspaces.push(old.workspace_id);
                     }
                 }
             }
@@ -612,11 +491,7 @@ impl NiriContext {
             Event::WindowLayoutsChanged { changes } => {
                 for (id, layout) in changes {
                     if let Some(pos) = self.tracked_window_positions.get_mut(&id) {
-                        let (col, tile) = layout
-                            .pos_in_scrolling_layout
-                            .map(|(c, t)| (Some(c), Some(t)))
-                            .unwrap_or((None, None));
-
+                        let (col, tile) = layout.pos_in_scrolling_layout.unzip();
                         debug!(
                             "window {} layout updated to column {:?}, tile {:?}, re-evaluating ws {}",
                             id, col, tile, pos.workspace_id
@@ -629,6 +504,7 @@ impl NiriContext {
             }
 
             Event::WindowClosed { id } => {
+                self.debounced_maximize_state.remove(&id);
                 if let Some(pos) = self.tracked_window_positions.remove(&id) {
                     info!(
                         "window {} closed, re-evaluating ws {}",
@@ -646,7 +522,7 @@ impl NiriContext {
             affected_workspaces.sort_unstable();
             affected_workspaces.dedup();
 
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20));
 
             let mut state = self.query_full_state()?;
 
@@ -658,53 +534,53 @@ impl NiriContext {
                 }
             }
             if stacked {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
                 state = self.query_full_state()?;
             }
 
-            let windows_map: HashMap<u64, &Window> =
-                state.windows.iter().map(|w| (w.id, w)).collect();
-
             for ws_id in affected_workspaces {
-                if let Err(e) = self.evaluate_workspace(ws_id, &state, &windows_map) {
+                if let Err(e) = self.evaluate_workspace(ws_id, &state) {
                     error!("error evaluating workspace {}: {:?}", ws_id, e);
                 }
                 if let Err(e) = self.equalize_columns(ws_id, &state) {
                     error!("error equalizing columns for workspace {}: {:?}", ws_id, e);
                 }
-                if self.resize_columns {
-                    if let Err(e) = self.redistribute_on_column_resize(ws_id, &state, &windows_map)
-                    {
-                        error!(
-                            "error redistributing columns for workspace {}: {:?}",
-                            ws_id, e
-                        );
-                    }
+                if self.resize_columns
+                    && let Err(e) = self.redistribute_on_column_resize(ws_id, &state)
+                {
+                    error!(
+                        "error redistributing columns for workspace {}: {:?}",
+                        ws_id, e
+                    );
                 }
             }
 
             for closed_pos in &closed_positions {
-                if let Some(closed_col) = closed_pos.column {
-                    let min_remaining_col = self
-                        .tracked_window_positions
-                        .values()
-                        .filter(|p| p.workspace_id == closed_pos.workspace_id)
-                        .filter_map(|p| p.column)
-                        .min();
-
-                    if let Some(min_col) = min_remaining_col {
-                        if closed_col > min_col {
-                            debug!(
-                                "closed window column {} had columns to the left, nudging viewport left",
-                                closed_col
-                            );
-                            let target_focus = self.query_focused_window().ok().flatten();
-                            let _ = self.send_action(Action::FocusColumnLeft {});
-                            if let Some(orig_id) = target_focus {
-                                let _ = self.send_action(Action::FocusWindow { id: orig_id });
-                            }
-                        }
-                    }
+                if !self
+                    .tracked_window_positions
+                    .values()
+                    .any(|p| p.workspace_id == closed_pos.workspace_id)
+                {
+                    self.last_maximize_action_time
+                        .remove(&closed_pos.workspace_id);
+                    self.tracked_column_counts.remove(&closed_pos.workspace_id);
+                    self.tracked_column_widths.remove(&closed_pos.workspace_id);
+                    continue;
+                }
+                let min_remaining_col = self
+                    .tracked_window_positions
+                    .values()
+                    .filter(|p| p.workspace_id == closed_pos.workspace_id)
+                    .filter_map(|p| p.column)
+                    .min();
+                if let (Some(closed_col), Some(min_col)) = (closed_pos.column, min_remaining_col)
+                    && closed_col > min_col
+                {
+                    debug!(
+                        "closed window column {} had columns to the left, nudging viewport left",
+                        closed_col
+                    );
+                    self.nudge_viewport_left();
                 }
             }
         }
