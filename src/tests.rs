@@ -18,6 +18,46 @@ pub struct MockConnection {
 
 impl NiriConnection for MockConnection {
     fn send_action(&mut self, action: Action) -> Result<()> {
+        let mut shared = self.shared.lock().unwrap();
+        if let Action::SetWindowWidth {
+            id: Some(id),
+            change: SizeChange::SetProportion(p),
+        } = action
+        {
+            let width = shared
+                .state
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .and_then(|w| w.workspace_id)
+                .and_then(|ws| shared.state.ws_outputs.get(&ws))
+                .and_then(|out| shared.state.output_widths.get(out))
+                .map(|&ow| ow * p / 100.0);
+            if let (Some(width), Some(w)) =
+                (width, shared.state.windows.iter_mut().find(|w| w.id == id))
+            {
+                w.layout.tile_size.0 = width;
+            }
+        }
+        shared.actions.push(action);
+        Ok(())
+    }
+    fn query_focused_window(&mut self) -> Result<Option<u64>> {
+        Ok(self.shared.lock().unwrap().focused_window)
+    }
+    fn query_full_state(&mut self) -> Result<NiriState> {
+        Ok(self.shared.lock().unwrap().state.clone())
+    }
+}
+
+pub struct SettlingMockConnection {
+    pub shared: Arc<Mutex<MockState>>,
+    pub queries_until_settle: Arc<Mutex<usize>>,
+    pub settled_width: f64,
+}
+
+impl NiriConnection for SettlingMockConnection {
+    fn send_action(&mut self, action: Action) -> Result<()> {
         self.shared.lock().unwrap().actions.push(action);
         Ok(())
     }
@@ -25,6 +65,15 @@ impl NiriConnection for MockConnection {
         Ok(self.shared.lock().unwrap().focused_window)
     }
     fn query_full_state(&mut self) -> Result<NiriState> {
+        let mut counter = self.queries_until_settle.lock().unwrap();
+        if *counter > 0 {
+            *counter -= 1;
+            if *counter == 0 {
+                for w in &mut self.shared.lock().unwrap().state.windows {
+                    w.layout.tile_size.0 = self.settled_width;
+                }
+            }
+        }
         Ok(self.shared.lock().unwrap().state.clone())
     }
 }
@@ -1103,6 +1152,152 @@ fn test_multi_column_target_never_stacks() {
     assert!(
         consume_left_ids(actions).is_empty(),
         "outputs with room for several columns must not stack: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_equalize_nudges_only_after_columns_settle() {
+    let win1 = create_mock_window(100, 1, 1, 0, 2560.0);
+    let win2 = create_mock_window(200, 1, 2, 0, 2560.0);
+    let win3 = create_mock_window(300, 1, 3, 0, 2560.0);
+
+    let output_name = "DP-1".to_string();
+    let mut output_widths = HashMap::new();
+    output_widths.insert(output_name.clone(), 5120.0);
+    let mut output_identities = HashMap::new();
+    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
+    let mut ws_outputs = HashMap::new();
+    ws_outputs.insert(1, output_name);
+
+    let shared = Arc::new(Mutex::new(MockState {
+        actions: Vec::new(),
+        focused_window: None,
+        state: NiriState {
+            windows: vec![win1.clone(), win2.clone(), win3.clone()],
+            output_widths,
+            output_identities,
+            ws_outputs,
+        },
+    }));
+
+    let queries_until_settle = Arc::new(Mutex::new(3usize));
+    let mut column_targets = HashMap::new();
+    column_targets.insert(WIDE_IDENTITY.to_string(), 3);
+    let mut ctx = NiriContext::new(
+        Box::new(SettlingMockConnection {
+            shared: shared.clone(),
+            queries_until_settle: queries_until_settle.clone(),
+            settled_width: 1706.0,
+        }),
+        false,
+        column_targets,
+    );
+
+    ctx.handle_event(Event::WindowsChanged {
+        windows: vec![win1, win2, win3],
+    })
+    .unwrap();
+
+    assert_eq!(
+        *queries_until_settle.lock().unwrap(),
+        0,
+        "equalize must poll state until the columns fit before nudging the viewport"
+    );
+
+    let actions = &shared.lock().unwrap().actions;
+    let last_resize = actions
+        .iter()
+        .rposition(|a| matches!(a, Action::SetWindowWidth { .. }))
+        .expect("columns must be resized");
+    let first_nudge = actions
+        .iter()
+        .position(|a| matches!(a, Action::FocusWindow { id: 100 }))
+        .expect("viewport must be nudged to the first column");
+    let last_nudge = actions
+        .iter()
+        .position(|a| matches!(a, Action::FocusWindow { id: 300 }))
+        .expect("viewport must be nudged to the last column");
+    assert!(
+        first_nudge > last_resize && last_nudge > first_nudge,
+        "nudges must come after the resizes, first column before last: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_close_nudges_only_after_remaining_columns_settle() {
+    let win1 = create_mock_window(100, 1, 1, 0, 1706.0);
+    let win2 = create_mock_window(200, 1, 2, 0, 1706.0);
+
+    let output_name = "DP-1".to_string();
+    let mut output_widths = HashMap::new();
+    output_widths.insert(output_name.clone(), 5120.0);
+    let mut output_identities = HashMap::new();
+    output_identities.insert(output_name.clone(), WIDE_IDENTITY.to_string());
+    let mut ws_outputs = HashMap::new();
+    ws_outputs.insert(1, output_name);
+
+    let shared = Arc::new(Mutex::new(MockState {
+        actions: Vec::new(),
+        focused_window: None,
+        state: NiriState {
+            windows: vec![win1, win2],
+            output_widths,
+            output_identities,
+            ws_outputs,
+        },
+    }));
+
+    let queries_until_settle = Arc::new(Mutex::new(3usize));
+    let mut column_targets = HashMap::new();
+    column_targets.insert(WIDE_IDENTITY.to_string(), 3);
+    let mut ctx = NiriContext::new(
+        Box::new(SettlingMockConnection {
+            shared: shared.clone(),
+            queries_until_settle: queries_until_settle.clone(),
+            settled_width: 2560.0,
+        }),
+        false,
+        column_targets,
+    );
+
+    for (id, col) in [(100, 1), (200, 2), (300, 3)] {
+        ctx.tracked_window_positions.insert(
+            id,
+            WindowPosition {
+                workspace_id: 1,
+                column: Some(col),
+                tile: Some(0),
+            },
+        );
+    }
+    ctx.tracked_column_counts.insert(1, 3);
+
+    ctx.handle_event(Event::WindowClosed { id: 300 }).unwrap();
+
+    assert_eq!(
+        *queries_until_settle.lock().unwrap(),
+        0,
+        "equalize must poll state until the remaining columns grew to halves before nudging"
+    );
+
+    let actions = &shared.lock().unwrap().actions;
+    let last_resize = actions
+        .iter()
+        .rposition(|a| matches!(a, Action::SetWindowWidth { .. }))
+        .expect("remaining columns must be resized");
+    let first_nudge = actions
+        .iter()
+        .position(|a| matches!(a, Action::FocusWindow { id: 100 }))
+        .expect("viewport must be nudged to the first column");
+    let last_nudge = actions
+        .iter()
+        .position(|a| matches!(a, Action::FocusWindow { id: 200 }))
+        .expect("viewport must be nudged to the last column");
+    assert!(
+        first_nudge > last_resize && last_nudge > first_nudge,
+        "nudges must come after the resizes, first column before last: {:?}",
         actions
     );
 }

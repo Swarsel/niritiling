@@ -6,6 +6,35 @@ use std::collections::HashMap;
 
 const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
 
+fn columns_settled(state: &NiriState, ws_id: u64, output_width: f64, share: f64) -> bool {
+    let mut columns: std::collections::BTreeMap<usize, (f64, Option<f64>)> =
+        std::collections::BTreeMap::new();
+    for w in &state.windows {
+        if w.workspace_id != Some(ws_id) || w.is_floating {
+            continue;
+        }
+        if let Some((col_idx, _)) = w.layout.pos_in_scrolling_layout {
+            columns.entry(col_idx).or_insert((
+                w.layout.tile_size.0,
+                w.layout.tile_pos_in_workspace_view.map(|(x, _)| x),
+            ));
+        }
+    }
+
+    let entries: Vec<(f64, Option<f64>)> = columns.into_values().collect();
+    let gap = entries
+        .windows(2)
+        .find_map(|pair| Some((pair[1].1? - pair[0].1? - pair[0].0).max(0.0)))
+        .unwrap_or(0.0);
+    let expected = (output_width - gap) * share / 100.0 - gap;
+
+    entries
+        .iter()
+        .all(|&(width, _)| (width - expected).abs() <= 20.0)
+        && entries.iter().map(|&(width, _)| width).sum::<f64>()
+            <= output_width - gap * (entries.len() + 1) as f64 + 2.0
+}
+
 pub struct NiriContext {
     pub connection: Box<dyn NiriConnection>,
     pub tracked_window_positions: HashMap<u64, WindowPosition>,
@@ -276,6 +305,20 @@ impl NiriContext {
         Ok(true)
     }
 
+    fn wait_for_columns_to_settle(&mut self, ws_id: u64, output_width: f64, share: f64) {
+        for _ in 0..24 {
+            match self.query_full_state() {
+                Ok(state) if columns_settled(&state, ws_id, output_width, share) => return,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => return,
+            }
+        }
+        debug!(
+            "workspace {}: columns did not settle within timeout, nudging anyway",
+            ws_id
+        );
+    }
+
     fn equalize_columns(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
         let output_name = match state.ws_outputs.get(&ws_id) {
             Some(name) => name,
@@ -315,7 +358,6 @@ impl NiriContext {
             "workspace {}: {} columns on output {} -> sizing columns to {:.1}%",
             ws_id, count, output_name, share
         );
-        let focused = self.query_focused_window().ok().flatten();
         for &(win_id, _) in columns.values() {
             self.send_action(Action::SetWindowWidth {
                 id: Some(win_id),
@@ -323,9 +365,19 @@ impl NiriContext {
             })?;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        match state.output_widths.get(output_name) {
+            Some(&width) if width > 0.0 && count <= target => {
+                self.wait_for_columns_to_settle(ws_id, width, share)
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+
+        let focused = self.query_focused_window().ok().flatten();
         if let Some(&(first_id, _)) = columns.values().next() {
             self.send_action(Action::FocusWindow { id: first_id })?;
+        }
+        if let Some(&(last_id, _)) = columns.values().next_back() {
+            self.send_action(Action::FocusWindow { id: last_id })?;
         }
         if let Some(orig_id) = focused {
             let _ = self.send_action(Action::FocusWindow { id: orig_id });
