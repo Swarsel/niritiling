@@ -5,7 +5,7 @@ edition = "2024"
 description = "Automatic window tiling for the first window in Niri"
 
 [dependencies]
-niri-ipc = "=25.8.0"
+niri-ipc = "=26.4.0"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

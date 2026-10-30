@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{error, info};
+use log::{debug, error, info};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Event, Request};
 use std::collections::HashMap;
@@ -95,7 +95,14 @@ fn run_event_loop(resize_columns: bool, column_targets: &HashMap<String, usize>)
     })?;
 
     loop {
-        let event = read_event().context("reading event from niri")?;
+        let event = match read_event() {
+            Ok(event) => event,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                debug!("skipping unrecognized event from niri: {e}");
+                continue;
+            }
+            Err(e) => return Err(e).context("reading event from niri"),
+        };
 
         if let Err(e) = context.handle_event(event) {
             error!("error handling event: {:?}", e);
