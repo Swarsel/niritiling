@@ -2,8 +2,9 @@ use super::connection::{NiriConnection, NiriState, WindowPosition};
 use super::manager::NiriContext;
 use anyhow::Result;
 use niri_ipc::{Action, Event, SizeChange, Window};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct MockState {
@@ -165,6 +166,7 @@ fn setup_test_with_resize(
             output_widths: HashMap::from([(output_name.clone(), 1000.0)]),
             output_identities: HashMap::new(),
             ws_outputs: HashMap::from([(1, output_name)]),
+            active_workspaces: HashSet::new(),
         },
     }));
 
@@ -172,7 +174,7 @@ fn setup_test_with_resize(
         shared: shared.clone(),
     });
     (
-        NiriContext::new(conn, resize_columns, HashMap::new()),
+        NiriContext::new(conn, resize_columns, HashMap::new(), 2),
         shared,
     )
 }
@@ -189,6 +191,7 @@ fn wide_mock_state(windows: Vec<Window>, output_width: f64) -> Arc<Mutex<MockSta
             output_widths: HashMap::from([(output_name.clone(), output_width)]),
             output_identities: HashMap::from([(output_name.clone(), WIDE_IDENTITY.to_string())]),
             ws_outputs: HashMap::from([(1, output_name)]),
+            active_workspaces: HashSet::new(),
         },
     }))
 }
@@ -204,7 +207,7 @@ fn setup_test_wide(
     let conn = Box::new(MockConnection {
         shared: shared.clone(),
     });
-    (NiriContext::new(conn, false, column_targets), shared)
+    (NiriContext::new(conn, false, column_targets, 2), shared)
 }
 
 fn setup_test_settling(
@@ -223,8 +226,80 @@ fn setup_test_settling(
         }),
         false,
         HashMap::from([(WIDE_IDENTITY.to_string(), 3)]),
+        2,
     );
     (ctx, shared, counter)
+}
+
+const LAPTOP_IDENTITY: &str = "BOE NE135A1M-NY1 Unknown";
+
+fn setup_test_two_outputs(
+    windows: Vec<Window>,
+    column_targets: &[(&str, usize)],
+) -> (NiriContext, Arc<Mutex<MockState>>) {
+    let shared = Arc::new(Mutex::new(MockState {
+        actions: Vec::new(),
+        focused_window: None,
+        state: NiriState {
+            windows,
+            output_widths: HashMap::from([
+                ("eDP-1".to_string(), 1000.0),
+                ("DP-1".to_string(), 5120.0),
+            ]),
+            output_identities: HashMap::from([
+                ("eDP-1".to_string(), LAPTOP_IDENTITY.to_string()),
+                ("DP-1".to_string(), WIDE_IDENTITY.to_string()),
+            ]),
+            ws_outputs: HashMap::from([(1, "DP-1".to_string())]),
+            active_workspaces: HashSet::from([1]),
+        },
+    }));
+    let column_targets = column_targets
+        .iter()
+        .map(|&(identity, n)| (identity.to_string(), n))
+        .collect();
+    let mut ctx = NiriContext::new(
+        Box::new(MockConnection {
+            shared: shared.clone(),
+        }),
+        false,
+        column_targets,
+        2,
+    );
+    ctx.output_settle_interval = Duration::ZERO;
+    (ctx, shared)
+}
+
+fn initial_sync(ctx: &mut NiriContext, shared: &Arc<Mutex<MockState>>) {
+    let windows = shared.lock().unwrap().state.windows.clone();
+    ctx.handle_event(Event::WindowsChanged { windows }).unwrap();
+}
+
+fn move_workspace(ctx: &mut NiriContext, shared: &Arc<Mutex<MockState>>, output: &str) {
+    initial_sync(ctx, shared);
+    let mut shared = shared.lock().unwrap();
+    shared.actions.clear();
+    shared.state.ws_outputs.insert(1, output.to_string());
+    drop(shared);
+    ctx.handle_event(Event::WorkspacesChanged {
+        workspaces: Vec::new(),
+    })
+    .unwrap();
+}
+
+fn three_wide_columns() -> Vec<Window> {
+    vec![
+        create_mock_window(100, 1, 0, 0, 1706.0),
+        create_mock_window(200, 1, 1, 0, 1706.0),
+        create_mock_window(300, 1, 2, 0, 1706.0),
+    ]
+}
+
+fn is_focus_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::FocusWindow { .. } | Action::FocusColumnLeft {} | Action::MaximizeColumn {}
+    )
 }
 
 fn consume_left_ids(actions: &[Action]) -> Vec<u64> {
@@ -1050,5 +1125,139 @@ fn test_single_column_output_ignores_floating_windows() {
         consume_left_ids(actions).is_empty(),
         "floating windows must not be stacked: {:?}",
         actions
+    );
+}
+
+#[test]
+fn test_output_change_resizes_to_new_target_once() {
+    let (mut ctx, shared) = setup_test_two_outputs(
+        three_wide_columns(),
+        &[(WIDE_IDENTITY, 3), (LAPTOP_IDENTITY, 2)],
+    );
+
+    move_workspace(&mut ctx, &shared, "eDP-1");
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(props.len(), 3, "expected all columns resized: {:?}", props);
+    for (_, p) in &props {
+        assert!((p - 50.0).abs() < 0.01, "expected halves, got {}", p);
+    }
+
+    shared.lock().unwrap().actions.clear();
+    ctx.handle_event(Event::WorkspacesChanged {
+        workspaces: Vec::new(),
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert!(
+        props.is_empty(),
+        "repeated event after the change must not resize again: {:?}",
+        props
+    );
+}
+
+#[test]
+fn test_output_change_to_single_column_output_stacks() {
+    let (mut ctx, shared) = setup_test_two_outputs(
+        vec![
+            create_mock_window(100, 1, 0, 0, 2560.0),
+            create_mock_window(200, 1, 1, 0, 2560.0),
+        ],
+        &[(WIDE_IDENTITY, 3), (LAPTOP_IDENTITY, 1)],
+    );
+
+    move_workspace(&mut ctx, &shared, "eDP-1");
+
+    assert_eq!(
+        consume_left_ids(&shared.lock().unwrap().actions),
+        vec![200],
+        "moving onto a single-column output should stack the workspace"
+    );
+}
+
+#[test]
+fn test_output_change_to_unconfigured_output_uses_default_columns() {
+    let (mut ctx, shared) = setup_test_two_outputs(three_wide_columns(), &[(WIDE_IDENTITY, 3)]);
+
+    move_workspace(&mut ctx, &shared, "eDP-1");
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(props.len(), 3, "expected all columns resized: {:?}", props);
+    for (_, p) in &props {
+        assert!((p - 50.0).abs() < 0.01, "expected halves, got {}", p);
+    }
+}
+
+#[test]
+fn test_output_change_on_inactive_workspace_resizes_without_focusing() {
+    let (mut ctx, shared) = setup_test_two_outputs(
+        three_wide_columns(),
+        &[(WIDE_IDENTITY, 3), (LAPTOP_IDENTITY, 2)],
+    );
+    shared.lock().unwrap().state.active_workspaces.clear();
+
+    move_workspace(&mut ctx, &shared, "eDP-1");
+
+    let actions = &shared.lock().unwrap().actions;
+    assert_eq!(
+        proportion_actions(actions).len(),
+        3,
+        "inactive workspace should still be resized: {:?}",
+        actions
+    );
+    assert!(
+        !actions.iter().any(is_focus_action),
+        "inactive workspace must not be focused: {:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_first_sync_does_not_count_as_output_change() {
+    let (mut ctx, shared) = setup_test_two_outputs(
+        vec![
+            create_mock_window(100, 1, 0, 0, 1500.0),
+            create_mock_window(200, 1, 1, 0, 3500.0),
+        ],
+        &[],
+    );
+
+    initial_sync(&mut ctx, &shared);
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert!(
+        props.is_empty(),
+        "first sync must not reset columns on an unconfigured output: {:?}",
+        props
+    );
+}
+
+#[test]
+fn test_output_width_change_resizes_columns() {
+    let win1 = create_mock_window(100, 1, 0, 0, 2560.0);
+    let win2 = create_mock_window(200, 1, 1, 0, 2560.0);
+    let (mut ctx, shared) = setup_test_two_outputs(vec![win1.clone(), win2], &[(WIDE_IDENTITY, 3)]);
+    initial_sync(&mut ctx, &shared);
+    {
+        let mut shared = shared.lock().unwrap();
+        shared.actions.clear();
+        shared
+            .state
+            .output_widths
+            .insert("DP-1".to_string(), 2560.0);
+    }
+
+    ctx.handle_event(Event::WindowLayoutsChanged {
+        changes: vec![(win1.id, win1.layout)],
+    })
+    .unwrap();
+
+    let props = proportion_actions(&shared.lock().unwrap().actions);
+    assert_eq!(
+        props.len(),
+        2,
+        "scale change on the same output should resize columns: {:?}",
+        props
     );
 }

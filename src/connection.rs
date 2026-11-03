@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use log::{error, warn};
 use niri_ipc::socket::Socket;
 use niri_ipc::{Action, Request, Response, Window};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Default)]
 pub struct NiriState {
@@ -10,6 +10,7 @@ pub struct NiriState {
     pub output_widths: HashMap<String, f64>,
     pub output_identities: HashMap<String, String>,
     pub ws_outputs: HashMap<u64, String>,
+    pub active_workspaces: HashSet<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -114,19 +115,23 @@ impl NiriConnection for SocketConnection {
             _ => anyhow::bail!("failed to query outputs"),
         };
 
-        let ws_outputs = match self
+        let (ws_outputs, active_workspaces) = match self
             .socket
             .send(Request::Workspaces)
             .context("querying workspaces")?
         {
             Ok(Response::Workspaces(workspaces)) => {
                 let mut mapping = HashMap::new();
+                let mut active = HashSet::new();
                 for ws in workspaces {
+                    if ws.is_active {
+                        active.insert(ws.id);
+                    }
                     if let Some(output) = ws.output {
                         mapping.insert(ws.id, output);
                     }
                 }
-                mapping
+                (mapping, active)
             }
             _ => anyhow::bail!("failed to query workspaces"),
         };
@@ -136,6 +141,7 @@ impl NiriConnection for SocketConnection {
             output_widths,
             output_identities,
             ws_outputs,
+            active_workspaces,
         })
     }
 }

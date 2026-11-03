@@ -10,7 +10,7 @@ When a workspace has a single tiled (=non-floating) window, it is automatically 
 
 Two more features:
  - It is possible to dynamically resize manually resized columns using the `--resize-columns` arg - this only works when exactly two columns are open in a workspace (i.e. when you resize one of the two windows the other resizes accordingly).
-- you can specify a display's "show at once" columns using `--columns "<make> <model> <serial>"=<N>`. If set at one, it will make it so that all new windows join into one stack (close to a "vertical scrolling" behavior)
+- you can specify a display's "show at once" columns using `--columns "<make> <model> <serial>"=<N>`. If set at one, it will make it so that all new windows join into one stack (close to a "vertical scrolling" behavior). When an output change triggers workspace changes, columns are resized to the new output's `--columns`. Outputs without that config use `--default-columns <N>` (default 2).
 
 ## Usage
 

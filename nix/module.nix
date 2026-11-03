@@ -12,6 +12,11 @@ in
       example."LG Electronics LG ULTRAFINE 510NTEPPU036" = 3;
       type = lib.types.attrsOf lib.types.ints.positive;
     };
+    defaultColumns = lib.mkOption {
+      default = 2;
+      description = "Column target applied when a workspace moves to an output that has no entry in columnTargets.";
+      type = lib.types.ints.positive;
+    };
     resizeColumns = lib.mkOption {
       default = false;
       description = "When a column is resized, adjust the other column to compensate (only works with exactly two columns).";
@@ -32,6 +37,8 @@ in
       serviceConfig = {
         CapabilityBoundingSet = "";
         ExecStart = "${cfg.package}/bin/niritiling${lib.optionalString cfg.resizeColumns " --resize-columns"}${
+          lib.optionalString (cfg.defaultColumns != 2) " --default-columns ${toString cfg.defaultColumns}"
+        }${
           lib.concatStrings (
             lib.mapAttrsToList (
               identity: n: " --columns ${lib.escapeShellArg "${identity}=${toString n}"}"

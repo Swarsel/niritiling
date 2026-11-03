@@ -34,20 +34,26 @@ fn main() -> Result<()> {
         );
         println!("                            N=1 keeps the output at one column and stacks newly");
         println!("                            opened windows into it");
+        println!(
+            "  --default-columns <N>     When a workspace moves to an output without a --columns"
+        );
+        println!("                            entry, size its columns to fit up to N side by side");
+        println!("                            (default: 2)");
         println!("  -h, --help                Show this help message");
         return Ok(());
     }
 
     let resize_columns = args.iter().any(|a| a == "--resize-columns");
     let column_targets = parse_column_targets(&args)?;
+    let default_columns = parse_default_columns(&args)?;
 
     info!(
-        "niritiling: starting (resize_columns={}, column_targets={:?})",
-        resize_columns, column_targets
+        "niritiling: starting (resize_columns={}, column_targets={:?}, default_columns={})",
+        resize_columns, column_targets, default_columns
     );
 
     loop {
-        if let Err(e) = run_event_loop(resize_columns, &column_targets) {
+        if let Err(e) = run_event_loop(resize_columns, &column_targets, default_columns) {
             error!(
                 "fatal error in event loop: {:?}. attempting to reconnect in 5 seconds...",
                 e
@@ -75,9 +81,29 @@ fn parse_column_targets(args: &[String]) -> Result<HashMap<String, usize>> {
     Ok(targets)
 }
 
-fn run_event_loop(resize_columns: bool, column_targets: &HashMap<String, usize>) -> Result<()> {
+fn parse_default_columns(args: &[String]) -> Result<usize> {
+    match args.iter().position(|a| a == "--default-columns") {
+        Some(i) => args
+            .get(i + 1)
+            .and_then(|n| n.parse().ok())
+            .filter(|&n| n > 0)
+            .context("--default-columns requires a positive integer"),
+        None => Ok(2),
+    }
+}
+
+fn run_event_loop(
+    resize_columns: bool,
+    column_targets: &HashMap<String, usize>,
+    default_columns: usize,
+) -> Result<()> {
     let conn = SocketConnection::new()?;
-    let mut context = NiriContext::new(Box::new(conn), resize_columns, column_targets.clone());
+    let mut context = NiriContext::new(
+        Box::new(conn),
+        resize_columns,
+        column_targets.clone(),
+        default_columns,
+    );
 
     let mut event_socket = Socket::connect().context("connecting to niri event stream")?;
     let _ = event_socket
@@ -90,6 +116,7 @@ fn run_event_loop(resize_columns: bool, column_targets: &HashMap<String, usize>)
         .connection
         .query_full_state()
         .context("initial state query failed")?;
+    context.seed_outputs(&state);
     context.handle_event(Event::WindowsChanged {
         windows: state.windows,
     })?;

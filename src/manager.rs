@@ -7,6 +7,31 @@ use std::time::{Duration, Instant};
 
 const MAXIMIZED_RATIO_THRESHOLD: f64 = 0.9;
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(200);
+const OUTPUT_SETTLE_INTERVAL: Duration = Duration::from_millis(1000);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSnapshot {
+    name: String,
+    identity: Option<String>,
+    width: Option<f64>,
+}
+
+fn output_snapshots(state: &NiriState) -> HashMap<u64, OutputSnapshot> {
+    state
+        .ws_outputs
+        .iter()
+        .map(|(&ws_id, name)| {
+            (
+                ws_id,
+                OutputSnapshot {
+                    name: name.clone(),
+                    identity: state.output_identities.get(name).cloned(),
+                    width: state.output_widths.get(name).copied(),
+                },
+            )
+        })
+        .collect()
+}
 
 fn tiled_columns(state: &NiriState, ws_id: u64) -> BTreeMap<usize, Vec<&Window>> {
     let mut columns: BTreeMap<usize, Vec<&Window>> = BTreeMap::new();
@@ -77,8 +102,11 @@ pub struct NiriContext {
     pub tracked_column_widths: HashMap<u64, HashMap<usize, f64>>,
     pub tracked_column_counts: HashMap<u64, usize>,
     pub last_maximize_action_time: HashMap<u64, Instant>,
+    pub tracked_outputs: HashMap<u64, OutputSnapshot>,
+    pub output_settle_interval: Duration,
     pub resize_columns: bool,
     pub column_targets: HashMap<String, usize>,
+    pub default_columns: usize,
 }
 
 impl NiriContext {
@@ -86,6 +114,7 @@ impl NiriContext {
         connection: Box<dyn NiriConnection>,
         resize_columns: bool,
         column_targets: HashMap<String, usize>,
+        default_columns: usize,
     ) -> Self {
         Self {
             connection,
@@ -94,8 +123,11 @@ impl NiriContext {
             tracked_column_widths: HashMap::new(),
             tracked_column_counts: HashMap::new(),
             last_maximize_action_time: HashMap::new(),
+            tracked_outputs: HashMap::new(),
+            output_settle_interval: OUTPUT_SETTLE_INTERVAL,
             resize_columns,
             column_targets,
+            default_columns,
         }
     }
 
@@ -277,13 +309,72 @@ impl NiriContext {
     }
 
     fn equalize_columns(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+        match self.column_target(ws_id, state) {
+            Some(target) if target > 1 => self.size_columns(ws_id, state, target, true),
+            _ => Ok(()),
+        }
+    }
+
+    fn reset_columns_after_output_change(
+        &mut self,
+        ws_id: u64,
+        state: &NiriState,
+        fix_viewport: bool,
+    ) -> Result<()> {
+        self.tracked_column_counts.remove(&ws_id);
+        self.tracked_column_widths.remove(&ws_id);
+        let target = self
+            .column_target(ws_id, state)
+            .unwrap_or(self.default_columns);
+        info!(
+            "workspace {}: output changed -> resetting columns for target {}",
+            ws_id, target
+        );
+        self.size_columns(ws_id, state, target, fix_viewport)
+    }
+
+    pub fn seed_outputs(&mut self, state: &NiriState) {
+        self.tracked_outputs = output_snapshots(state);
+    }
+
+    fn take_output_changes(&mut self, state: &mut NiriState) -> Result<Vec<u64>> {
+        let mut snapshots = output_snapshots(state);
+        if !self.changed_outputs(&snapshots).is_empty() {
+            info!(
+                "output configuration changed, waiting {:?} for it to settle",
+                self.output_settle_interval
+            );
+            std::thread::sleep(self.output_settle_interval);
+            *state = self.query_full_state()?;
+            snapshots = output_snapshots(state);
+        }
+        let changed = self.changed_outputs(&snapshots);
+        self.tracked_outputs = snapshots;
+        Ok(changed)
+    }
+
+    fn changed_outputs(&self, snapshots: &HashMap<u64, OutputSnapshot>) -> Vec<u64> {
+        snapshots
+            .iter()
+            .filter(|&(ws_id, snapshot)| {
+                self.tracked_outputs
+                    .get(ws_id)
+                    .is_some_and(|prev| prev != snapshot)
+            })
+            .map(|(&ws_id, _)| ws_id)
+            .collect()
+    }
+
+    fn size_columns(
+        &mut self,
+        ws_id: u64,
+        state: &NiriState,
+        target: usize,
+        fix_viewport: bool,
+    ) -> Result<()> {
         let output_name = match state.ws_outputs.get(&ws_id) {
             Some(name) => name,
             None => return Ok(()),
-        };
-        let target = match self.column_target(ws_id, state) {
-            Some(t) if t > 1 => t,
-            _ => return Ok(()),
         };
 
         let column_ids: Vec<u64> = tiled_columns(state, ws_id)
@@ -307,6 +398,10 @@ impl NiriContext {
                 id: Some(win_id),
                 change: SizeChange::SetProportion(share),
             })?;
+        }
+
+        if !fix_viewport {
+            return Ok(());
         }
 
         match state.output_widths.get(output_name) {
@@ -415,6 +510,7 @@ impl NiriContext {
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
         let mut affected_workspaces = Vec::new();
         let mut closed_positions: Vec<WindowPosition> = Vec::new();
+        let workspaces_changed = matches!(event, Event::WorkspacesChanged { .. });
 
         match event {
             Event::WindowsChanged { windows } => {
@@ -518,13 +614,15 @@ impl NiriContext {
             _ => {}
         }
 
-        if !affected_workspaces.is_empty() {
-            affected_workspaces.sort_unstable();
-            affected_workspaces.dedup();
-
+        if !affected_workspaces.is_empty() || workspaces_changed {
             std::thread::sleep(Duration::from_millis(20));
 
             let mut state = self.query_full_state()?;
+
+            let output_changed = self.take_output_changes(&mut state)?;
+            affected_workspaces.extend(&output_changed);
+            affected_workspaces.sort_unstable();
+            affected_workspaces.dedup();
 
             let mut stacked = false;
             for &ws_id in &affected_workspaces {
@@ -539,13 +637,21 @@ impl NiriContext {
             }
 
             for ws_id in affected_workspaces {
-                if let Err(e) = self.evaluate_workspace(ws_id, &state) {
+                let moved = output_changed.contains(&ws_id);
+                let may_focus = !moved || state.active_workspaces.contains(&ws_id);
+                if may_focus && let Err(e) = self.evaluate_workspace(ws_id, &state) {
                     error!("error evaluating workspace {}: {:?}", ws_id, e);
                 }
-                if let Err(e) = self.equalize_columns(ws_id, &state) {
+                let sized = if moved {
+                    self.reset_columns_after_output_change(ws_id, &state, may_focus)
+                } else {
+                    self.equalize_columns(ws_id, &state)
+                };
+                if let Err(e) = sized {
                     error!("error equalizing columns for workspace {}: {:?}", ws_id, e);
                 }
                 if self.resize_columns
+                    && !moved
                     && let Err(e) = self.redistribute_on_column_resize(ws_id, &state)
                 {
                     error!(
