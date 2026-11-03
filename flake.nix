@@ -2,87 +2,102 @@
   description = "niritiling - automatic window tiling for the first window in Niri";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    treefmt-nix = {
-      url = "github:numtide/treefmt-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+
     git-hooks-nix = {
-      url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:cachix/git-hooks.nix";
+    };
+
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    pedantix = {
+      inputs = {
+        flake-parts.follows = "flake-parts";
+        git-hooks-nix.follows = "git-hooks-nix";
+        nixpkgs.follows = "nixpkgs";
+        treefmt-nix.follows = "treefmt-nix";
+      };
+      url = "github:Swarsel/pedantix";
+    };
+
+    treefmt-nix = {
+      inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:numtide/treefmt-nix";
     };
   };
 
-  outputs = inputs: inputs.flake-parts.lib.mkFlake { inherit inputs; } {
-    imports = [
-      inputs.treefmt-nix.flakeModule
-      inputs.git-hooks-nix.flakeModule
-    ];
+  outputs =
+    inputs:
+    inputs.flake-parts.lib.mkFlake { inherit inputs; } {
+      flake =
+        let
+          inherit (inputs.nixpkgs) lib;
+        in
+        {
+          nixosModules = rec {
+            default = niritiling;
+            niritiling = { pkgs, ... }: {
+              imports = [ ./nix/module.nix ];
 
-    systems = [ "x86_64-linux" "aarch64-linux" ];
-
-    perSystem = { config, self', pkgs, ... }: {
-      treefmt = {
-        programs = {
-          nixpkgs-fmt.enable = true;
-          rustfmt.enable = true;
-          deadnix.enable = true;
-          statix.enable = true;
-        };
-      };
-
-      pre-commit.settings = {
-        settings = {
-          rust = {
-            cargoManifestPath = "./Cargo.toml";
-            check.cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
-          };
-        };
-        hooks = {
-          treefmt.enable = true;
-          clippy.enable = true;
-        };
-      };
-
-      packages = rec {
-        niritiling = pkgs.rustPlatform.buildRustPackage {
-          pname = "niritiling";
-          version = "0.3.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          meta.mainProgram = "niritiling";
-        };
-        default = niritiling;
-      };
-
-      devShells.default = pkgs.mkShell {
-        inputsFrom = [ self'.packages.default ];
-        nativeBuildInputs = with pkgs; [
-          rust-analyzer
-          clippy
-        ];
-        shellHook = config.pre-commit.installationScript;
-      };
-    };
-
-    flake =
-      let
-        inherit (inputs.nixpkgs) lib;
-      in
-      {
-        nixosModules = rec {
-          niritiling = { pkgs, ... }: {
-            imports = [ ./nix/module.nix ];
-
-            options.services.niritiling.package = lib.mkOption {
-              type = lib.types.package;
-              description = "The niritiling package to use.";
-              default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.niritiling;
+              options.services.niritiling.package = lib.mkOption {
+                default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.niritiling;
+                description = "The niritiling package to use.";
+                type = lib.types.package;
+              };
             };
           };
-          default = niritiling;
         };
-      };
-  };
+      imports = [
+        inputs.treefmt-nix.flakeModule
+        inputs.git-hooks-nix.flakeModule
+        inputs.pedantix.flakeModules.default
+      ];
+      perSystem =
+        { config
+        , pkgs
+        , self'
+        , ...
+        }:
+        {
+          devShells.default = pkgs.mkShell {
+            inputsFrom = [ self'.packages.default ];
+            nativeBuildInputs = with pkgs; [
+              rust-analyzer
+              clippy
+            ];
+            shellHook = config.pre-commit.installationScript;
+          };
+          packages = rec {
+            default = niritiling;
+            niritiling = pkgs.rustPlatform.buildRustPackage {
+              cargoLock.lockFile = ./Cargo.lock;
+              pname = "niritiling";
+              src = ./.;
+              version = "0.3.0";
+              meta.mainProgram = "niritiling";
+            };
+          };
+          pre-commit.settings = {
+            hooks = {
+              clippy.enable = true;
+              treefmt.enable = true;
+            };
+            settings.rust = {
+              cargoManifestPath = "./Cargo.toml";
+              check.cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+            };
+          };
+          treefmt.programs = {
+            deadnix.enable = true;
+            pedantix.enable = true;
+            rustfmt.enable = true;
+            statix.enable = true;
+          };
+        };
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+    };
 }
