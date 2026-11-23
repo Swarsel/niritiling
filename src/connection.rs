@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 pub struct NiriState {
     pub windows: Vec<Window>,
     pub output_widths: HashMap<String, f64>,
+    pub output_heights: HashMap<String, f64>,
     pub output_identities: HashMap<String, String>,
     pub ws_outputs: HashMap<u64, String>,
     pub active_workspaces: HashSet<u64>,
@@ -84,13 +85,14 @@ impl NiriConnection for SocketConnection {
             _ => anyhow::bail!("failed to query windows"),
         };
 
-        let (output_widths, output_identities) = match self
+        let (output_widths, output_heights, output_identities) = match self
             .socket
             .send(Request::Outputs)
             .context("querying outputs")?
         {
             Ok(Response::Outputs(outputs)) => {
                 let mut widths = HashMap::new();
+                let mut heights = HashMap::new();
                 let mut identities = HashMap::new();
                 for (name, out) in outputs {
                     identities.insert(
@@ -104,13 +106,14 @@ impl NiriConnection for SocketConnection {
                     );
                     if let Some(logical) = out.logical {
                         if logical.width > 0 {
+                            heights.insert(name.clone(), logical.height as f64);
                             widths.insert(name, logical.width as f64);
                         } else {
                             warn!("output {} has non-positive width: {}", name, logical.width);
                         }
                     }
                 }
-                (widths, identities)
+                (widths, heights, identities)
             }
             _ => anyhow::bail!("failed to query outputs"),
         };
@@ -139,6 +142,7 @@ impl NiriConnection for SocketConnection {
         Ok(NiriState {
             windows,
             output_widths,
+            output_heights,
             output_identities,
             ws_outputs,
             active_workspaces,

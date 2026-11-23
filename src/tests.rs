@@ -136,6 +136,12 @@ fn create_mock_fullscreen_window(id: u64, ws_id: u64, width: f64) -> Window {
     serde_json::from_value(v).expect("failed to deserialize mock window")
 }
 
+fn create_mock_fullscreen_column(id: u64, ws_id: u64, col: usize) -> Window {
+    let mut window = create_mock_window(id, ws_id, col, 0, 1000.0);
+    window.layout.tile_size.1 = 800.0;
+    window
+}
+
 fn track(ctx: &mut NiriContext, positions: &[(u64, usize, usize)]) {
     for &(id, col, tile) in positions {
         ctx.tracked_window_positions.insert(
@@ -164,6 +170,7 @@ fn setup_test_with_resize(
         state: NiriState {
             windows,
             output_widths: HashMap::from([(output_name.clone(), 1000.0)]),
+            output_heights: HashMap::from([(output_name.clone(), 800.0)]),
             output_identities: HashMap::new(),
             ws_outputs: HashMap::from([(1, output_name)]),
             active_workspaces: HashSet::new(),
@@ -189,6 +196,7 @@ fn wide_mock_state(windows: Vec<Window>, output_width: f64) -> Arc<Mutex<MockSta
         state: NiriState {
             windows,
             output_widths: HashMap::from([(output_name.clone(), output_width)]),
+            output_heights: HashMap::new(),
             output_identities: HashMap::from([(output_name.clone(), WIDE_IDENTITY.to_string())]),
             ws_outputs: HashMap::from([(1, output_name)]),
             active_workspaces: HashSet::new(),
@@ -246,6 +254,7 @@ fn setup_test_two_outputs(
                 ("eDP-1".to_string(), 1000.0),
                 ("DP-1".to_string(), 5120.0),
             ]),
+            output_heights: HashMap::new(),
             output_identities: HashMap::from([
                 ("eDP-1".to_string(), LAPTOP_IDENTITY.to_string()),
                 ("DP-1".to_string(), WIDE_IDENTITY.to_string()),
@@ -1259,5 +1268,60 @@ fn test_output_width_change_resizes_columns() {
         2,
         "scale change on the same output should resize columns: {:?}",
         props
+    );
+}
+
+#[test]
+fn test_fullscreen_column_is_not_unmaximized() {
+    let win1 = create_mock_window(100, 1, 0, 0, 500.0);
+    let win2_fullscreen = create_mock_fullscreen_column(101, 1, 1);
+    let (mut ctx, shared) = setup_test(vec![win1, win2_fullscreen.clone()]);
+
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
+
+    ctx.handle_event(Event::WindowOpenedOrChanged {
+        window: win2_fullscreen,
+    })
+    .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        actions.is_empty(),
+        "A fullscreen window should be left alone: actions={:?}",
+        actions
+    );
+}
+
+#[test]
+fn test_leaving_fullscreen_does_not_redistribute() {
+    let win1 = create_mock_window_at(100, 1, 0, 0, 500.0, 0.0);
+    let win2 = create_mock_window_at(101, 1, 1, 0, 500.0, 500.0);
+    let (mut ctx, shared) = setup_test_with_resize(vec![win1.clone(), win2.clone()], true);
+
+    track(&mut ctx, &[(100, 0, 0), (101, 1, 0)]);
+
+    ctx.tracked_column_widths
+        .insert(1, HashMap::from([(0, 500.0), (1, 500.0)]));
+
+    let win2_fullscreen = create_mock_fullscreen_column(101, 1, 1);
+    shared.lock().unwrap().state.windows = vec![win1.clone(), win2_fullscreen.clone()];
+    ctx.handle_event(Event::WindowOpenedOrChanged {
+        window: win2_fullscreen,
+    })
+    .unwrap();
+
+    ctx.last_maximize_action_time.clear();
+
+    shared.lock().unwrap().state.windows = vec![win1, win2.clone()];
+    ctx.handle_event(Event::WindowOpenedOrChanged { window: win2 })
+        .unwrap();
+
+    let actions = &shared.lock().unwrap().actions;
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::SetWindowWidth { .. })),
+        "Leaving fullscreen is not a manual resize: actions={:?}",
+        actions
     );
 }

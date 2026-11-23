@@ -72,6 +72,25 @@ fn is_maximized(window: &Window, state: &NiriState) -> bool {
     ratio > MAXIMIZED_RATIO_THRESHOLD
 }
 
+fn has_fullscreen_window(state: &NiriState, ws_id: u64) -> bool {
+    let Some(output_name) = state.ws_outputs.get(&ws_id) else {
+        return false;
+    };
+    let (Some(&output_width), Some(&output_height)) = (
+        state.output_widths.get(output_name),
+        state.output_heights.get(output_name),
+    ) else {
+        return false;
+    };
+
+    state.windows.iter().any(|w| {
+        w.workspace_id == Some(ws_id)
+            && !w.is_floating
+            && (w.layout.tile_size.0 - output_width).abs() < 1.0
+            && (w.layout.tile_size.1 - output_height).abs() < 1.0
+    })
+}
+
 fn columns_settled(state: &NiriState, ws_id: u64, output_width: f64, share: f64) -> bool {
     let entries: Vec<(f64, Option<f64>)> = tiled_columns(state, ws_id)
         .into_values()
@@ -194,6 +213,14 @@ impl NiriContext {
     }
 
     pub fn evaluate_workspace(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+        if has_fullscreen_window(state, ws_id) {
+            debug!(
+                "workspace {}: fullscreen window, leaving columns alone",
+                ws_id
+            );
+            return Ok(());
+        }
+
         let columns = tiled_columns(state, ws_id);
 
         if columns.len() == 1 {
@@ -425,6 +452,10 @@ impl NiriContext {
     }
 
     fn redistribute_on_column_resize(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+        if has_fullscreen_window(state, ws_id) {
+            return Ok(());
+        }
+
         let output_name = match state.ws_outputs.get(&ws_id) {
             Some(name) => name,
             None => return Ok(()),
