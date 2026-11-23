@@ -187,11 +187,7 @@ impl NiriContext {
         }
     }
 
-    fn perform_maximize_action(
-        &mut self,
-        target_window_id: u64,
-        restore_focus: bool,
-    ) -> Result<()> {
+    fn perform_maximize_action(&mut self, target_window_id: u64) -> Result<()> {
         let original_focus = self.query_focused_window().ok().flatten();
 
         if original_focus != Some(target_window_id) {
@@ -202,8 +198,7 @@ impl NiriContext {
 
         self.send_action(Action::MaximizeColumn {})?;
 
-        if restore_focus
-            && let Some(orig_id) = original_focus
+        if let Some(orig_id) = original_focus
             && orig_id != target_window_id
         {
             debug!("restoring focus to {}", orig_id);
@@ -212,13 +207,13 @@ impl NiriContext {
         Ok(())
     }
 
-    pub fn evaluate_workspace(&mut self, ws_id: u64, state: &NiriState) -> Result<()> {
+    pub fn evaluate_workspace(&mut self, ws_id: u64, state: &NiriState) -> Result<bool> {
         if has_fullscreen_window(state, ws_id) {
             debug!(
                 "workspace {}: fullscreen window, leaving columns alone",
                 ws_id
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let columns = tiled_columns(state, ws_id);
@@ -230,48 +225,44 @@ impl NiriContext {
                     "workspace {}: single column -> maximizing window {}",
                     ws_id, window.id
                 );
-                self.perform_maximize_action(window.id, true)?;
+                self.perform_maximize_action(window.id)?;
                 self.last_maximize_action_time.insert(ws_id, Instant::now());
             }
-            return Ok(());
+            return Ok(false);
         }
 
-        let mut original_focus = None;
-        let mut did_unmaximize = false;
-        for (&col_idx, tiles) in &columns {
+        let mut found_maximized = false;
+        for tiles in columns.values() {
             let window = tiles[0];
             if is_maximized(window, state) && self.debounce_allows(window.id, false) {
-                if !did_unmaximize {
-                    original_focus = self.query_focused_window().ok().flatten();
-                }
-                info!(
-                    "workspace {}: multiple columns -> un-maximizing window {} in column {}",
-                    ws_id, window.id, col_idx
-                );
-                self.perform_maximize_action(window.id, false)?;
-                did_unmaximize = true;
+                found_maximized = true;
             }
         }
-
-        if did_unmaximize {
-            self.last_maximize_action_time.insert(ws_id, Instant::now());
-            debug!(
-                "workspace {}: waiting for layout to settle before viewport nudge",
-                ws_id
-            );
-            std::thread::sleep(Duration::from_millis(50));
-
-            debug!(
-                "workspace {}: nudging viewport left (target focus: {:?})",
-                ws_id, original_focus
-            );
-            self.send_action(Action::FocusColumnLeft {})?;
-            if let Some(orig_id) = original_focus {
-                debug!("workspace {}: restoring focus to {}", ws_id, orig_id);
-                let _ = self.send_action(Action::FocusWindow { id: orig_id });
-            }
+        if !found_maximized {
+            return Ok(false);
         }
-        Ok(())
+
+        let target = self
+            .column_target(ws_id, state)
+            .unwrap_or(self.default_columns);
+        let share = 100.0 / (columns.len().min(target) as f64);
+        info!(
+            "workspace {}: maximized column among {} columns -> resetting columns to {:.1}%",
+            ws_id,
+            columns.len(),
+            share
+        );
+        for tiles in columns.values() {
+            self.send_action(Action::SetWindowWidth {
+                id: Some(tiles[0].id),
+                change: SizeChange::SetProportion(share),
+            })?;
+        }
+        self.last_maximize_action_time.insert(ws_id, Instant::now());
+
+        std::thread::sleep(Duration::from_millis(50));
+        self.nudge_viewport_left();
+        Ok(true)
     }
 
     fn column_target(&self, ws_id: u64, state: &NiriState) -> Option<usize> {
@@ -670,13 +661,18 @@ impl NiriContext {
             for ws_id in affected_workspaces {
                 let moved = output_changed.contains(&ws_id);
                 let may_focus = !moved || state.active_workspaces.contains(&ws_id);
-                if may_focus && let Err(e) = self.evaluate_workspace(ws_id, &state) {
-                    error!("error evaluating workspace {}: {:?}", ws_id, e);
-                }
-                let sized = if moved {
-                    self.reset_columns_after_output_change(ws_id, &state, may_focus)
-                } else {
+                let columns_reset = may_focus
+                    && self.evaluate_workspace(ws_id, &state).unwrap_or_else(|e| {
+                        error!("error evaluating workspace {}: {:?}", ws_id, e);
+                        false
+                    });
+
+                let sized = if !moved {
                     self.equalize_columns(ws_id, &state)
+                } else if columns_reset {
+                    Ok(())
+                } else {
+                    self.reset_columns_after_output_change(ws_id, &state, may_focus)
                 };
                 if let Err(e) = sized {
                     error!("error equalizing columns for workspace {}: {:?}", ws_id, e);

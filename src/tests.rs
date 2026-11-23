@@ -366,11 +366,16 @@ fn test_two_columns_unmaximize() {
         .unwrap();
 
     let actions = &shared.lock().unwrap().actions;
+    assert_eq!(
+        proportion_actions(actions),
+        vec![(100, 50.0), (101, 50.0)],
+        "Both columns should be reset to the default share"
+    );
     assert!(
-        actions
+        !actions
             .iter()
             .any(|a| matches!(a, Action::MaximizeColumn {})),
-        "MaximizeColumn should be sent to un-maximize"
+        "The previous width must not be restored by toggling MaximizeColumn"
     );
     assert!(
         actions
@@ -459,11 +464,7 @@ fn test_drag_out_of_column_nudges_and_unmaximizes() {
         .unwrap();
 
     let actions = &shared.lock().unwrap().actions;
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::MaximizeColumn {}))
-    );
+    assert_eq!(proportion_actions(actions), vec![(100, 50.0), (101, 50.0)]);
     assert!(
         actions
             .iter()
